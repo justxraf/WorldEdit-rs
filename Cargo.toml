@@ -1,0 +1,28 @@
+[package]
+name = "worldedit-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# This is the api crate that makes creating plugins easier, and has wit definitions.
+pumpkin-plugin-api = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-plugin-api" }
+tracing = "0.1.44"
+
+# Schematic loading.
+# fastnbt parses the NBT inside a .schem; flate2 (pure-Rust miniz_oxide backend) gunzips it.
+fastnbt = "2.6.1"
+flate2 = { version = "1.0.30", default-features = false, features = ["rust_backend"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[build-dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+[profile.release]
+lto = true
+
+[package.metadata.component]
+target = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-plugin-wit" }

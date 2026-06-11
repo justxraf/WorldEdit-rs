@@ -1,0 +1,12 @@
+# Build to the Pumpkin plugin target by default.
+[build]
+target = "wasm32-wasip2"
+
+# Use the newer standalone wasm-component-ld (0.5.22+) instead of the one bundled
+# with the Rust toolchain (0.5.15). The bundled linker rejects componentization of
+# the Pumpkin WIT because wit-bindgen 0.57 encodes enum/record names like
+# `generic-nine-x-one` and `line-one` in an abbreviated form (`generic-9x1`,
+# `line-1`) that older validators consider non-kebab-case. 0.5.22 is lenient enough
+# to emit the component. Install with: cargo install wasm-component-ld --locked
+[target.wasm32-wasip2]
+linker = "C:\\Users\\justxdude\\.cargo\\bin\\wasm-component-ld.exe"
