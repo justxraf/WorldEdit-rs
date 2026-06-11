@@ -2,10 +2,10 @@
 //! Pastes a parsed [`Schematic`] (from [`crate::schematic`]) into the world at
 //! a centre point.
 //!
-//! TODO(FAWE parity): wire this into a `//schematic load <name>` + `//paste`
-//! flow (FAWE's `//schem load`/`SchematicCommands`) so `.schem` files can be
-//! loaded into the clipboard, not just placed directly. Currently unused by
-//! any registered command — kept for that purpose.
+//! `//schematic load <name>` now loads files into the clipboard for `//paste`.
+//! This direct-centre paste helper remains unused by registered commands, but
+//! is kept for callers that want to place a parsed schematic without going
+//! through clipboard state.
 //!
 //! ## Centring
 //! `centre` is the block position the island's middle should land on. The

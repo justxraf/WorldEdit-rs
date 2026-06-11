@@ -1,13 +1,9 @@
-//! `//replace <from> <to>` — replace one block type with another within the
-//! current selection.
+//! `//replace [from] <to>` - replace blocks in the current selection.
 //!
-//! Mirrors WorldEdit's `RegionCommands#replace` (aliases `/re`, `/rep`), minus
-//! mask/pattern support: both arguments are single block names or numeric
-//! global state ids resolved via [`crate::mapping::resolve_block`].
-//!
-//! TODO(FAWE parity): WorldEdit's `//replace [from] <to>` makes `from` an
-//! optional `Mask` (defaulting to "anything that isn't air") and `to` a full
-//! `Pattern`. Here both are required, single literal block names or ids.
+//! Mirrors WorldEdit/FAWE's default mask behavior for the one-argument form:
+//! `//replace <to>` replaces every non-air block. The two-argument form
+//! `//replace <from> <to>` replaces one literal source block state. The target
+//! accepts this plugin's supported pattern subset.
 
 use pumpkin_plugin_api::{
     Context,
@@ -18,23 +14,23 @@ use pumpkin_plugin_api::{
     world::BlockChange,
 };
 
-use crate::{history, history::EditEntry, mapping};
+use crate::{history, history::EditEntry, mapping, pattern::BlockPattern};
 
 use super::{batch_size, block_flags, command_names, require_selection};
 
 pub fn register(context: &Context) {
-    let to_arg = CommandNode::argument("to", &ArgumentType::String(StringType::SingleWord))
+    let to_arg = CommandNode::argument("to", &ArgumentType::String(StringType::Greedy))
         .execute(ReplaceCommand);
-    let from_arg = CommandNode::argument("from", &ArgumentType::String(StringType::SingleWord));
-    from_arg.then(to_arg);
+    let from_or_to_arg =
+        CommandNode::argument("from_or_to", &ArgumentType::String(StringType::SingleWord))
+            .execute(ReplaceCommand);
+    from_or_to_arg.then(to_arg);
     let replace_command =
         Command::new(&command_names("replace"), "Replace blocks in the selection");
-    replace_command.then(from_arg);
-    context.register_command(replace_command, "worldedit-rs:command.replace");
+    replace_command.then(from_or_to_arg);
+    context.register_command(replace_command, "worldedit.region.replace");
 }
 
-/// Handler for `//replace <from> <to>` — replaces matching blocks within the
-/// current selection.
 struct ReplaceCommand;
 
 impl pumpkin_plugin_api::commands::CommandHandler for ReplaceCommand {
@@ -48,32 +44,35 @@ impl pumpkin_plugin_api::commands::CommandHandler for ReplaceCommand {
             return Ok(0);
         };
 
-        let from = match args.get_value("from") {
+        let first = match args.get_value("from_or_to") {
             Arg::Simple(s) => s,
             other => {
                 sender.send_error(TextComponent::text(&format!(
-                    "Expected a block name, got {other:?}"
+                    "Expected a block name or pattern, got {other:?}"
                 )));
                 return Ok(0);
             }
         };
-        let to = match args.get_value("to") {
-            Arg::Simple(s) => s,
-            other => {
-                sender.send_error(TextComponent::text(&format!(
-                    "Expected a block name, got {other:?}"
-                )));
-                return Ok(0);
-            }
+        let (from, raw_to) = match args.get_value("to") {
+            Arg::Simple(to) | Arg::Msg(to) => (Some(first), to),
+            _ => (None, first),
         };
 
-        let Some(from_id) = mapping::resolve_block(&from) else {
-            sender.send_error(TextComponent::text(&format!("Unknown block '{from}'.")));
-            return Ok(0);
+        let from_id = if let Some(from) = &from {
+            let Some(from_id) = mapping::resolve_block(from) else {
+                sender.send_error(TextComponent::text(&format!("Unknown block '{from}'.")));
+                return Ok(0);
+            };
+            Some(from_id)
+        } else {
+            None
         };
-        let Some(to_id) = mapping::resolve_block(&to) else {
-            sender.send_error(TextComponent::text(&format!("Unknown block '{to}'.")));
-            return Ok(0);
+        let to = match BlockPattern::parse(&raw_to) {
+            Ok(pattern) => pattern,
+            Err(message) => {
+                sender.send_error(TextComponent::text(&message));
+                return Ok(0);
+            }
         };
 
         let started = std::time::Instant::now();
@@ -83,9 +82,13 @@ impl pumpkin_plugin_api::commands::CommandHandler for ReplaceCommand {
             let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
             for &pos in batch {
                 let before = world.get_block_state_id(pos);
-                if before == from_id && before != to_id {
-                    entry.changes.push((pos, before, to_id));
-                    changes.push(BlockChange { pos, state: to_id });
+                if should_replace(before, from_id) {
+                    let after = to.state_at(pos, before);
+                    if before == after {
+                        continue;
+                    }
+                    entry.changes.push((pos, before, after));
+                    changes.push(BlockChange { pos, state: after });
                 }
             }
             if !changes.is_empty() {
@@ -98,13 +101,48 @@ impl pumpkin_plugin_api::commands::CommandHandler for ReplaceCommand {
         logging::log(
             LogLevel::Info,
             &format!(
-                "WorldEdit-rs: //replace {from} {to} replaced {replaced} blocks in {:?}.",
+                "WorldEdit-rs: //replace replaced {replaced} blocks in {:?}.",
                 started.elapsed()
             ),
         );
-        sender.send_message(TextComponent::text(&format!(
-            "Replaced {replaced} blocks of '{from}' with '{to}'."
-        )));
+        let message = TextComponent::text(&format!("Replaced {replaced} blocks of "));
+        if let (Some(from), Some(from_id)) = (&from, from_id) {
+            message.add_child(mapping::display_component(from, from_id));
+        } else {
+            message.add_text("non-air");
+        }
+        message.add_text(" with ");
+        if let Some((input, state_id)) = to.literal_display() {
+            message.add_child(mapping::display_component(input, state_id));
+        } else {
+            message.add_text(to.description());
+        }
+        message.add_text(".");
+        sender.send_message(message);
         Ok(1)
+    }
+}
+
+fn should_replace(before: u16, from_id: Option<u16>) -> bool {
+    match from_id {
+        Some(from_id) => before == from_id,
+        None => before != 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_arg_replace_targets_non_air() {
+        assert!(should_replace(1, None));
+        assert!(!should_replace(0, None));
+    }
+
+    #[test]
+    fn two_arg_replace_targets_only_source_state() {
+        assert!(should_replace(1, Some(1)));
+        assert!(!should_replace(3, Some(1)));
     }
 }

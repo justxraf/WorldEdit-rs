@@ -1,15 +1,13 @@
-//! `//undo [times]` — undo the player's last edit(s).
+//! `//undo [times] [player]` - undo edit(s).
 //!
-//! Mirrors WorldEdit's `HistoryCommands#undo`.
-//!
-//! TODO(FAWE parity): WorldEdit's `//undo [times] [player]` accepts an
-//! optional `player` argument so operators can undo another player's edits.
-//! Not implemented — only the invoking player's own history is addressable.
+//! Mirrors WorldEdit/FAWE's `HistoryCommands#undo` shape. History is still
+//! stored per player key in memory, so the optional `player` argument selects
+//! another key from that map.
 
 use pumpkin_plugin_api::{
     Context,
     command::{Command, CommandError, CommandNode, CommandSender, ConsumedArgs},
-    command_wit::{Arg, ArgumentType, Number},
+    command_wit::{Arg, ArgumentType, Number, StringType},
     logging::{self, LogLevel},
     text::TextComponent,
     world::{BlockChange, World},
@@ -20,25 +18,28 @@ use crate::history::{self, EditEntry};
 use super::{block_flags, command_names, player_key};
 
 /// Upper bound on `//undo <times>` / `//redo <times>` so a typo can't request
-/// an absurd number of pops (each is still capped by the history stack size
-/// in `crate::history`, but this keeps the argument itself sane).
+/// an absurd number of pops.
 const MAX_TIMES: i32 = 64;
 
 pub fn register(context: &Context) {
-    // `//undo <times>` — undo `times` edits.
+    let player_after_times =
+        CommandNode::argument("player", &ArgumentType::String(StringType::SingleWord))
+            .execute(UndoCommand);
     let times_arg =
         CommandNode::argument("times", &ArgumentType::Integer((Some(1), Some(MAX_TIMES))))
             .execute(UndoCommand);
+    times_arg.then(player_after_times);
 
-    // Bare `//undo` — undo once. Both forms share one command tree, since
-    // registering two `Command`s under the same name would have the second
-    // overwrite the first in the dispatcher.
+    let player_arg = CommandNode::argument("player", &ArgumentType::String(StringType::SingleWord))
+        .execute(UndoCommand);
+
     let undo = Command::new(&command_names("undo"), "Undo your last edit").execute(UndoCommand);
     undo.then(times_arg);
-    context.register_command(undo, "worldedit-rs:command.undo");
+    undo.then(player_arg);
+    context.register_command(undo, "worldedit.history.undo");
 }
 
-/// Handler for `//undo` and `//undo <times>`.
+/// Handler for `//undo`, `//undo <times>`, and `//undo <times> <player>`.
 struct UndoCommand;
 
 impl pumpkin_plugin_api::commands::CommandHandler for UndoCommand {
@@ -52,7 +53,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for UndoCommand {
             sender.send_error(TextComponent::text("Only players can use this command."));
             return Ok(0);
         }
-        let Some(key) = player_key(&sender) else {
+        let Some(sender_key) = player_key(&sender) else {
             return Ok(0);
         };
         let Some(world) = sender.world() else {
@@ -68,8 +69,11 @@ impl pumpkin_plugin_api::commands::CommandHandler for UndoCommand {
                 )));
                 return Ok(0);
             }
-            // No `times` argument was provided — the bare `//undo` form.
             _ => 1,
+        };
+        let key = match args.get_value("player") {
+            Arg::Simple(player) => player,
+            _ => sender_key,
         };
 
         let mut undone = 0;
@@ -90,7 +94,9 @@ impl pumpkin_plugin_api::commands::CommandHandler for UndoCommand {
             LogLevel::Info,
             &format!("WorldEdit-rs: //undo reverted {undone} edit(s) for {key}."),
         );
-        sender.send_message(TextComponent::text(&format!("Undid {undone} edit(s).")));
+        sender.send_message(TextComponent::text(&format!(
+            "Undid {undone} edit(s) for {key}."
+        )));
         Ok(1)
     }
 }

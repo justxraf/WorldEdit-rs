@@ -2,6 +2,12 @@
 //! or a raw numeric global state id (e.g. `"1"`) to a Pumpkin global
 //! block-state id (the `u16` that [`world.set-block-state`](crate) wants).
 //!
+//! Also provides [`display_component`], which turns a block name or state id
+//! back into a [`TextComponent`] suitable for chat messages — a translatable
+//! `block.minecraft.<name>` component (rendered in each client's own
+//! language) where possible, falling back to a humanized name like
+//! "Grass Block" otherwise.
+//!
 //! ## How it resolves a name
 //! 1. Split the palette string into a base name and a sorted property list.
 //! 2. Look the base name up in the generated table ([`GENERATED_BLOCKS`], built by
@@ -18,6 +24,8 @@
 //! as a global state id directly (see [`resolve_block`]). It's accepted as
 //! long as it fits in the `0..=MAX_STATE_ID` range emitted by `build.rs`
 //! (or `0..=4095`, a generous guess, when the full registry isn't embedded).
+
+use pumpkin_plugin_api::text::TextComponent;
 
 /// One block as emitted by `build.rs`. `variants` is `(property-string, state-id)`
 /// where `property-string` is the canonical `k=v,k=v` form with keys sorted.
@@ -102,6 +110,80 @@ pub fn has_full_registry() -> bool {
     !GENERATED_BLOCKS.is_empty()
 }
 
+/// A chat-friendly representation of a block, for messages like
+/// `//set <block>`'s "Set N blocks to <name>."
+///
+/// `input` is whatever the player typed (a name, palette key, or numeric
+/// state id) and `state_id` is the id it resolved to. Where possible this
+/// returns a translatable `block.minecraft.<name>` component, which each
+/// client renders in its own configured language; otherwise it falls back to
+/// a humanized name such as "Grass Block".
+pub fn display_component(input: &str, state_id: u16) -> TextComponent {
+    let name = if input.trim().parse::<u16>().is_ok() {
+        // Numeric input (a raw state id) carries no name — recover one by
+        // reverse-looking-up the resolved state id in the generated table.
+        name_for_state_id(state_id).map(str::to_string)
+    } else {
+        Some(normalize(split_key(input).0))
+    };
+
+    match name.as_deref().and_then(|n| n.strip_prefix("minecraft:")) {
+        Some(suffix) => TextComponent::translate(&format!("block.minecraft.{suffix}"), Vec::new()),
+        None => TextComponent::text(&humanize(name.as_deref().unwrap_or(input))),
+    }
+}
+
+/// Reverse-lookup: find the generated block whose default state or one of its
+/// variants matches `state_id`, returning its namespaced name.
+fn name_for_state_id(state_id: u16) -> Option<&'static str> {
+    GENERATED_BLOCKS.iter().find_map(|block| {
+        let matches =
+            block.default_id == state_id || block.variants.iter().any(|&(_, id)| id == state_id);
+        matches.then_some(block.name)
+    })
+}
+
+/// Reverse-lookup a global state id to a Sponge schematic palette key, e.g.
+/// `"minecraft:oak_log[axis=x]"` or `"minecraft:stone"` (no properties).
+///
+/// Used by `//schematic save` to turn the state ids stored in a clipboard
+/// back into palette entries. Falls back to `"minecraft:air"` for state id
+/// `0` and for any id that isn't in the generated table (so saving never
+/// fails outright when the full registry isn't embedded).
+pub fn palette_key_for_state_id(state_id: u16) -> String {
+    if state_id == 0 {
+        return "minecraft:air".to_string();
+    }
+
+    for block in GENERATED_BLOCKS {
+        if let Some((props, _)) = block.variants.iter().find(|&&(_, id)| id == state_id) {
+            return format!("{}[{}]", block.name, props);
+        }
+        if block.default_id == state_id {
+            return block.name.to_string();
+        }
+    }
+
+    "minecraft:air".to_string()
+}
+
+/// Turn `"minecraft:grass_block"` (or `"grass_block"`) into `"Grass Block"`:
+/// strip the namespace, replace underscores with spaces, and title-case each
+/// word.
+fn humanize(name: &str) -> String {
+    let name = name.split_once(':').map_or(name, |(_, rest)| rest);
+    name.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn find_generated(name: &str) -> Option<&'static GeneratedBlock> {
     GENERATED_BLOCKS.iter().find(|b| b.name == name)
 }
@@ -179,10 +261,27 @@ mod tests {
     }
 
     #[test]
+    fn humanize_strips_namespace_and_underscores() {
+        assert_eq!(humanize("minecraft:grass_block"), "Grass Block");
+        assert_eq!(humanize("oak_log"), "Oak Log");
+        assert_eq!(humanize("stone"), "Stone");
+    }
+
+    #[test]
     fn resolve_block_falls_back_to_name() {
         assert_eq!(
             resolve_block("minecraft:stone"),
             state_id_for("minecraft:stone")
+        );
+    }
+
+    #[test]
+    fn palette_key_round_trips_through_state_id() {
+        assert_eq!(palette_key_for_state_id(0), "minecraft:air");
+        let stone_id = state_id_for("minecraft:stone").unwrap();
+        assert_eq!(
+            state_id_for(&palette_key_for_state_id(stone_id)),
+            Some(stone_id)
         );
     }
 }

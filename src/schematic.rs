@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use fastnbt::{ByteArray, IntArray};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A parsed, version-normalized schematic ready to paste.
 pub struct Schematic {
@@ -216,6 +216,97 @@ fn decode_varints(buf: &[u8]) -> Vec<i32> {
     out
 }
 
+/// Encode palette indices as unsigned LEB128 varints (the inverse of
+/// [`decode_varints`]).
+fn encode_varints(indices: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let mut value = index as u32;
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    out
+}
+
+/// Approximate Minecraft data version for the schematic's `DataVersion`
+/// field. WorldEdit/FAWE use this to decide whether block states need
+/// updating on load; readers tolerate a slightly stale value, so this is
+/// kept as a single constant rather than detected at runtime.
+const DATA_VERSION: i32 = 3953; // Minecraft 1.21
+
+/// Serialize `width`x`height`x`length` `blocks` (in `x + z*W + y*W*L` order,
+/// one Sponge palette key per cell) into a gzip-compressed Sponge v2
+/// `.schem`.
+///
+/// `offset` is stored as-is and reproduced by [`parse`] on load.
+pub fn write(
+    width: u16,
+    height: u16,
+    length: u16,
+    offset: [i32; 3],
+    blocks: &[String],
+) -> Result<Vec<u8>, SchematicError> {
+    let expected = width as usize * height as usize * length as usize;
+    if blocks.len() != expected {
+        return Err(SchematicError::Malformed(format!(
+            "block count {} != Width*Height*Length {}",
+            blocks.len(),
+            expected
+        )));
+    }
+
+    // Build the palette: assign each distinct key a local id in first-seen
+    // order, with `minecraft:air` always present (and id 0) even if unused,
+    // matching what most readers expect.
+    let mut palette: HashMap<String, i32> = HashMap::new();
+    palette.insert("minecraft:air".to_string(), 0);
+    let mut indices = Vec::with_capacity(blocks.len());
+    for key in blocks {
+        let next_id = palette.len() as i32;
+        let id = *palette.entry(key.clone()).or_insert(next_id);
+        indices.push(id);
+    }
+
+    let raw = RawRootOwned {
+        width,
+        height,
+        length,
+        offset: IntArray::new(offset.to_vec()),
+        palette_max: palette.len() as i32,
+        palette,
+        block_data: ByteArray::new(
+            encode_varints(&indices)
+                .into_iter()
+                .map(|b| b as i8)
+                .collect(),
+        ),
+        data_version: DATA_VERSION,
+        version: 2,
+    };
+
+    let nbt = fastnbt::to_bytes(&raw).map_err(|e| SchematicError::Nbt(e.to_string()))?;
+    gzip(&nbt)
+}
+
+/// Gzip `bytes` (the inverse of [`gunzip_if_needed`]).
+fn gzip(bytes: &[u8]) -> Result<Vec<u8>, SchematicError> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .map_err(|e| SchematicError::Gunzip(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| SchematicError::Gunzip(e.to_string()))
+}
+
 // ---- Raw NBT shapes -------------------------------------------------------
 
 /// The root compound. v3 puts data under `Schematic`; v2 is flat at the root, so
@@ -259,6 +350,30 @@ struct RawBlocks {
     // `Data` is a TAG_Byte_Array; fastnbt needs `ByteArray`, not `Vec<i8>`.
     #[serde(rename = "Data")]
     data: Option<ByteArray>,
+}
+
+/// Flat Sponge v2 root compound, written by [`write`] and readable by
+/// [`parse`] (which accepts v2's flat layout via `RawRoot::flat`).
+#[derive(Serialize)]
+struct RawRootOwned {
+    #[serde(rename = "Width")]
+    width: u16,
+    #[serde(rename = "Height")]
+    height: u16,
+    #[serde(rename = "Length")]
+    length: u16,
+    #[serde(rename = "Offset")]
+    offset: IntArray,
+    #[serde(rename = "PaletteMax")]
+    palette_max: i32,
+    #[serde(rename = "Palette")]
+    palette: HashMap<String, i32>,
+    #[serde(rename = "BlockData")]
+    block_data: ByteArray,
+    #[serde(rename = "DataVersion")]
+    data_version: i32,
+    #[serde(rename = "Version")]
+    version: i32,
 }
 
 #[cfg(test)]
@@ -312,5 +427,39 @@ mod tests {
         assert_eq!(s.index_of(1, 0, 0), 1);
         assert_eq!(s.index_of(0, 0, 1), 2); // z+1
         assert_eq!(s.index_of(0, 1, 0), 4); // y+1 (skips a full W*L layer)
+    }
+
+    #[test]
+    fn encode_varints_round_trips_decode_varints() {
+        let indices = vec![0, 1, 2, 127, 300, 16384];
+        assert_eq!(decode_varints(&encode_varints(&indices)), indices);
+    }
+
+    #[test]
+    fn write_then_parse_round_trips_blocks_and_dimensions() {
+        let blocks = vec![
+            "minecraft:stone".to_string(),
+            "minecraft:air".to_string(),
+            "minecraft:oak_log[axis=x]".to_string(),
+            "minecraft:dirt".to_string(),
+            "minecraft:dirt".to_string(),
+            "minecraft:dirt".to_string(),
+            "minecraft:dirt".to_string(),
+            "minecraft:dirt".to_string(),
+        ];
+        let bytes = write(2, 2, 2, [1, -2, 3], &blocks).unwrap();
+        let parsed = parse(&bytes).unwrap();
+
+        assert_eq!((parsed.width, parsed.height, parsed.length), (2, 2, 2));
+        assert_eq!(parsed.offset, [1, -2, 3]);
+        assert_eq!(parsed.blocks, blocks);
+        // One air cell out of eight, so seven non-air blocks.
+        assert_eq!(parsed.non_air_blocks.len(), 7);
+    }
+
+    #[test]
+    fn write_rejects_mismatched_block_count() {
+        let blocks = vec!["minecraft:stone".to_string()];
+        assert!(write(2, 2, 2, [0, 0, 0], &blocks).is_err());
     }
 }

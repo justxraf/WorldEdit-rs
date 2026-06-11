@@ -4,25 +4,31 @@
 //! commands across `SelectionCommands`, `RegionCommands`, `ClipboardCommands`,
 //! and `HistoryCommands`. [`register`] wires every command into the host.
 //!
-//! TODO(FAWE parity): WorldEdit registers commands under a `/we` (or `//`)
-//! dispatcher with per-command permission nodes like
-//! `worldedit.region.set` / `worldedit.history.undo`. Pumpkin's command API
-//! takes one permission node per registered [`Command`], so each command here
-//! gets its own `worldedit-rs:command.<name>` node (registered in [`register`])
-//! rather than the finer-grained sub-permissions FAWE offers (e.g. per-mask
-//! or per-pattern permissions). Not implemented — see the TODO list at the
-//! bottom of this file.
+//! Commands use WorldEdit's documented permission node suffixes where Pumpkin
+//! can attach a node directly to the registered [`Command`]. Pumpkin requires
+//! plugin-owned permission nodes, so `worldedit.region.set` is registered as
+//! `worldedit-rs:worldedit.region.set`. Internal `worldedit-rs:command.<name>`
+//! nodes are kept only where WorldEdit documents no command permission, or
+//! where a single Pumpkin command contains multiple WorldEdit subcommands that
+//! need handler-level checks.
 
+mod clearclipboard;
+mod clearhistory;
 mod copy;
+mod count;
 mod cut;
 mod paste;
 mod pos;
 mod redo;
 mod replace;
+mod schematic;
 mod sel;
 mod set;
+mod shell;
 mod size;
+mod transform;
 mod undo;
+mod wand;
 
 use pumpkin_plugin_api::{
     Context,
@@ -36,52 +42,119 @@ use pumpkin_plugin_api::{
 
 use crate::selection;
 
+const PERMISSION_NAMESPACE: &str = "worldedit-rs";
+
 /// Register every `//` command and its permission node.
 pub fn register(context: &Context) {
     for (node, description) in [
         (
-            "worldedit-rs:command.pos",
+            "worldedit.selection.pos",
             "Allows setting selection points with //pos1 and //pos2.",
         ),
         (
-            "worldedit-rs:command.sel",
-            "Allows clearing the selection with //sel.",
+            "worldedit.selection.hpos",
+            "Allows setting selection points with //hpos1 and //hpos2.",
         ),
         (
-            "worldedit-rs:command.set",
+            "worldedit.analysis.sel",
+            "Allows clearing or changing the selection type with //sel.",
+        ),
+        (
+            "worldedit.region.set",
             "Allows filling the selection with //set.",
         ),
         (
-            "worldedit-rs:command.replace",
+            "worldedit.region.replace",
             "Allows replacing blocks in the selection with //replace.",
         ),
         (
-            "worldedit-rs:command.copy",
+            "worldedit.clipboard.copy",
             "Allows copying the selection with //copy.",
         ),
         (
-            "worldedit-rs:command.cut",
+            "worldedit.clipboard.cut",
             "Allows cutting the selection with //cut.",
         ),
         (
-            "worldedit-rs:command.paste",
+            "worldedit.clipboard.paste",
             "Allows pasting the clipboard with //paste.",
         ),
         (
-            "worldedit-rs:command.undo",
+            "worldedit.history.undo",
             "Allows undoing your last edit with //undo.",
         ),
         (
-            "worldedit-rs:command.redo",
+            "worldedit.history.redo",
             "Allows redoing your last undone edit with //redo.",
         ),
         (
-            "worldedit-rs:command.size",
+            "worldedit.selection.size",
             "Allows viewing selection info with //size.",
         ),
+        (
+            "worldedit.clipboard.clear",
+            "Allows clearing your clipboard with //clearclipboard.",
+        ),
+        (
+            "worldedit.history.clear",
+            "Allows clearing your history with //clearhistory.",
+        ),
+        (
+            "worldedit.selection.expand",
+            "Allows expanding selections with //expand.",
+        ),
+        (
+            "worldedit.selection.contract",
+            "Allows contracting selections with //contract.",
+        ),
+        (
+            "worldedit.selection.shift",
+            "Allows shifting selections with //shift.",
+        ),
+        (
+            "worldedit.selection.outset",
+            "Allows outsetting selections with //outset.",
+        ),
+        (
+            "worldedit.selection.inset",
+            "Allows insetting selections with //inset.",
+        ),
+        (
+            "worldedit.analysis.count",
+            "Allows counting blocks with //count.",
+        ),
+        (
+            "worldedit.region.walls",
+            "Allows building selection walls with //walls.",
+        ),
+        (
+            "worldedit.region.faces",
+            "Allows building selection faces with //faces and //outline.",
+        ),
+        (
+            "worldedit.wand",
+            "Allows getting the selection wand with //wand.",
+        ),
+        (
+            "worldedit.schematic.save",
+            "Allows saving schematics with //schematic save.",
+        ),
+        (
+            "worldedit.schematic.load",
+            "Allows loading schematics with //schematic load.",
+        ),
+        (
+            "worldedit.schematic.list",
+            "Allows listing schematics with //schematic list.",
+        ),
+        (
+            "worldedit-rs:command.schematic",
+            "Allows using the //schematic dispatcher.",
+        ),
     ] {
+        let node = permission_node(node);
         if let Err(e) = context.register_permission(&Permission {
-            node: node.to_string(),
+            node: node.clone(),
             description: description.to_string(),
             default: PermissionDefault::Allow,
             children: Vec::new(),
@@ -103,11 +176,20 @@ pub fn register(context: &Context) {
     undo::register(context);
     redo::register(context);
     size::register(context);
+    clearclipboard::register(context);
+    clearhistory::register(context);
+    transform::register(context);
+    count::register(context);
+    shell::register(context);
+    wand::register(context);
+    schematic::register(context);
 
     logging::log(
         LogLevel::Info,
-        "WorldEdit-rs: //pos1, //pos2, //sel, //set, //replace, //copy, //cut, //paste, //undo, \
-         //redo, //size registered.",
+        "WorldEdit-rs: //pos1, //pos2, //hpos1, //hpos2, //sel, //set, //replace, //copy, //cut, \
+         //paste, //undo, //redo, //size, //clearclipboard, //clearhistory, //expand, //contract, \
+         //shift, //outset, //inset, //count, //walls, //faces, //outline, //wand, //schematic \
+         (//schem) registered.",
     );
 }
 
@@ -117,16 +199,45 @@ pub fn player_key(sender: &CommandSender) -> Option<String> {
     sender.as_player().map(|_| sender.get_name())
 }
 
-/// Names to register a `//<name>` command under: the bare literal (e.g.
-/// `pos1`, which is what `//pos1` resolves to after the client and dispatcher
-/// each strip one leading `/`) plus a `/`-prefixed alias (e.g. `/pos1`) so
-/// the literal also appears in the suggestion graph for `//` tab-completion.
+/// Names to register a `//<name>` command under: the bare literal plus a
+/// `/`-prefixed alias for `//` tab-completion.
 pub fn command_names(name: &str) -> Vec<String> {
     vec![name.to_string(), format!("/{name}")]
 }
 
-/// Common setup shared by every region command: requires a player, a position,
-/// a world, and a completed selection. Returns `(player_key, world, region)`.
+/// Pumpkin requires plugin-owned permission nodes. Command registration already
+/// prefixes permission strings without a namespace, but explicit permission
+/// registration and handler-level checks need to do the same work here.
+pub fn permission_node(node: &str) -> String {
+    if node.contains(':') {
+        node.to_string()
+    } else {
+        format!("{PERMISSION_NAMESPACE}:{node}")
+    }
+}
+
+/// Enforce a subcommand permission from inside a handler.
+///
+/// Pumpkin can attach only one permission to each registered command tree, so
+/// nested command trees such as `//schematic save|load|list` use this extra
+/// check to keep their WorldEdit permission nodes distinct.
+pub fn require_permission(
+    sender: &CommandSender,
+    server: &pumpkin_plugin_api::Server,
+    node: &str,
+) -> std::result::Result<(), ()> {
+    if sender.has_permission(server, &permission_node(node)) {
+        Ok(())
+    } else {
+        sender.send_error(TextComponent::text(
+            "You do not have permission to use this command.",
+        ));
+        Err(())
+    }
+}
+
+/// Common setup shared by every region command: requires a player, a world,
+/// and a completed selection. Returns `(player_key, world, region)`.
 pub fn require_selection(
     sender: &CommandSender,
 ) -> std::result::Result<(String, pumpkin_plugin_api::world::World, selection::Region), ()> {
@@ -153,12 +264,10 @@ pub fn require_selection(
 }
 
 /// Block-update flags for bulk edits: force the state, skip drops, and skip
-/// per-block callbacks/physics — keeps large `//set`/`//replace`/`//paste`
-/// operations quiet and fast.
+/// per-block callbacks/physics to keep large operations quiet and fast.
 ///
-/// TODO(FAWE parity): FAWE exposes this as the "side effects" / `-n` (no
-/// physics) toggle on commands like `//set` and `//paste` (see `//update` and
-/// `SideEffectSet`). Here it's always-on and not configurable per command.
+/// TODO(FAWE parity): FAWE exposes this as the "side effects" / `-n` toggle
+/// on commands like `//set` and `//paste`. Here it is always on.
 pub fn block_flags() -> BlockFlags {
     BlockFlags::SKIP_DROPS
         | BlockFlags::FORCE_STATE
@@ -181,50 +290,9 @@ pub fn sender_block_pos(sender: &CommandSender) -> std::result::Result<BlockPos,
     }
 }
 
-/// Batch size for `set_block_states`/`get_block_state_id` loops — keeps a
-/// single region operation from building one enormous change list (a whole
-/// region collected into one `Vec` can overflow the plugin's 32-bit wasm
-/// linear memory).
+/// Batch size for `set_block_states`/`get_block_state_id` loops. This keeps a
+/// single region operation from building one enormous change list in wasm
+/// linear memory.
 pub fn batch_size() -> usize {
     1 << 16 // 65,536
 }
-
-// ---------------------------------------------------------------------------
-// TODO(FAWE parity): commands not yet implemented.
-//
-// Selection (SelectionCommands):
-// - //hpos1, //hpos2 — set a position to the block the player is looking at
-//   (needs a block-trace/raycast API from the host; not currently exposed).
-// - //expand, //contract, //shift — resize/move the selection by an amount.
-// - //count, //distr — analyze blocks in the selection by mask.
-// - Non-cuboid selections (polygon, cylinder, sphere, convex). Only the
-//   axis-aligned cuboid `Region` in `crate::selection` is supported.
-//
-// Region edits (RegionCommands):
-// - //walls, //faces/outline, //overlay, //center, //hollow, //naturalize.
-// - //line, //curve, //move, //stack, //regen, //deform, //smooth.
-// - Masks (`-m`) and complex patterns (e.g. `50%stone,50%dirt`,
-//   `#existing`). //set and //replace currently take one literal block name
-//   or numeric state id each, resolved via `crate::mapping::resolve_block`.
-//
-// Clipboard (ClipboardCommands):
-// - //rotate, //flip, //clearclipboard.
-// - Entity/biome copy (`-e`, `-b` flags) — only block states are captured.
-// - `-a` (skip air) flag for //paste; current //paste always overwrites with
-//   the captured block, including air ("stamp" semantics).
-// - Schematic load/save (`//schem load|save`) — `crate::schem_paste` and
-//   `crate::schematic` already implement `.schem` parsing/pasting and just
-//   need a command + clipboard integration.
-//
-// History (HistoryCommands):
-// - //clearhistory.
-// - `//undo [times] [player]` / `//redo [times] [player]` — only an optional
-//   `times` count for the invoking player is implemented; the `player`
-//   argument (for operators undoing others' edits) is not.
-// - Disk-backed history for very large edits (see `crate::history`).
-//
-// General:
-// - Per-command fine-grained permissions beyond one node per command.
-// - A "//" wand (selection tool) bound to an item, and tool-based commands
-//   (`//brush`, etc.) — entirely out of scope for this plugin so far.
-// ---------------------------------------------------------------------------

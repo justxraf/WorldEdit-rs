@@ -17,7 +17,7 @@ mod clipboard;
 mod commands;
 mod history;
 mod mapping;
-mod probe_test;
+mod pattern;
 mod schem_paste;
 mod schematic;
 mod selection;
@@ -42,7 +42,10 @@ impl Plugin for WorldEditPlugin {
             authors: vec!["justxraf".to_string()],
             description: "A small WorldEdit-style editing plugin for Pumpkin.".to_string(),
             dependencies: vec![],
-            permissions: vec![permissions::FS_READ_DATA.to_string()],
+            permissions: vec![
+                permissions::FS_READ_DATA.to_string(),
+                permissions::FS_WRITE_DATA.to_string(),
+            ],
         }
     }
 

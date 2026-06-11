@@ -1,38 +1,33 @@
-//! `//cut` — copy the current selection into the clipboard, then clear it to
-//! air.
+//! `//cut [leave]` - copy the current selection, then replace it.
 //!
-//! Mirrors WorldEdit's `ClipboardCommands#cut`, with the `leavePattern`
-//! hard-coded to air.
-//!
-//! TODO(FAWE parity): WorldEdit's `//cut [leavePattern]` lets you specify what
-//! replaces the cut region (default air), plus the same `-e`/`-b`/`-m` flags
-//! as `//copy`. Only "replace with air" is implemented here.
+//! Mirrors WorldEdit/FAWE's block-only `ClipboardCommands#cut`: the optional
+//! leave pattern defaults to air and accepts this plugin's supported pattern
+//! subset.
 
 use pumpkin_plugin_api::{
     Context,
-    command::{Command, CommandError, CommandSender, ConsumedArgs},
+    command::{Command, CommandError, CommandNode, CommandSender, ConsumedArgs},
+    command_wit::{Arg, ArgumentType, StringType},
     logging::{self, LogLevel},
     text::TextComponent,
     world::BlockChange,
 };
 
-use crate::{clipboard, history, history::EditEntry};
+use crate::{clipboard, history, history::EditEntry, pattern::BlockPattern};
 
 use super::{batch_size, block_flags, command_names, require_selection, sender_block_pos};
 
-/// Air's global block-state id.
 const AIR_STATE_ID: u16 = 0;
 
 pub fn register(context: &Context) {
-    let cut_command = Command::new(
-        &command_names("cut"),
-        "Cut the selection to your clipboard, replacing it with air",
-    )
-    .execute(CutCommand);
-    context.register_command(cut_command, "worldedit-rs:command.cut");
+    let leave_arg = CommandNode::argument("leave", &ArgumentType::String(StringType::Greedy))
+        .execute(CutCommand);
+    let cut_command = Command::new(&command_names("cut"), "Cut the selection to your clipboard")
+        .execute(CutCommand);
+    cut_command.then(leave_arg);
+    context.register_command(cut_command, "worldedit.clipboard.cut");
 }
 
-/// Handler for `//cut` — copies the selection, then fills it with air.
 struct CutCommand;
 
 impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
@@ -40,7 +35,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         &self,
         sender: CommandSender,
         _server: pumpkin_plugin_api::Server,
-        _args: ConsumedArgs,
+        args: ConsumedArgs,
     ) -> std::result::Result<i32, CommandError> {
         let Ok((key, world, region)) = require_selection(&sender) else {
             return Ok(0);
@@ -48,6 +43,20 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         let Ok(origin) = sender_block_pos(&sender) else {
             return Ok(0);
         };
+        let leave_pattern = match args.get_value("leave") {
+            Arg::Simple(block) | Arg::Msg(block) => match BlockPattern::parse(&block) {
+                Ok(pattern) => pattern,
+                Err(message) => {
+                    sender.send_error(TextComponent::text(&message));
+                    return Ok(0);
+                }
+            },
+            _ => BlockPattern::Literal {
+                input: "minecraft:air".to_string(),
+                state_id: AIR_STATE_ID,
+            },
+        };
+        let leave_name = leave_pattern.description().to_string();
 
         let started = std::time::Instant::now();
         let buffer = clipboard::capture(&world, &region, origin);
@@ -60,13 +69,14 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
             let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
             for &pos in batch {
                 let before = world.get_block_state_id(pos);
-                if before == AIR_STATE_ID {
+                let leave_state = leave_pattern.state_at(pos, before);
+                if before == leave_state {
                     continue;
                 }
-                entry.changes.push((pos, before, AIR_STATE_ID));
+                entry.changes.push((pos, before, leave_state));
                 changes.push(BlockChange {
                     pos,
-                    state: AIR_STATE_ID,
+                    state: leave_state,
                 });
             }
             cleared += changes.len();
@@ -79,12 +89,12 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         logging::log(
             LogLevel::Info,
             &format!(
-                "WorldEdit-rs: //cut copied {copied} blocks and cleared {cleared} in {:?}.",
+                "WorldEdit-rs: //cut copied {copied} blocks and replaced {cleared} in {:?}.",
                 started.elapsed()
             ),
         );
         sender.send_message(TextComponent::text(&format!(
-            "Cut {copied} blocks to your clipboard ({cleared} set to air)."
+            "Cut {copied} blocks to your clipboard ({cleared} set to {leave_name})."
         )));
         Ok(1)
     }

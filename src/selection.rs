@@ -6,6 +6,69 @@ use std::collections::HashMap;
 
 use pumpkin_plugin_api::common::BlockPos;
 
+/// A cardinal direction used by selection transform commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+    North,
+    South,
+    West,
+    East,
+}
+
+impl Direction {
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.to_ascii_lowercase().as_str() {
+            "u" | "up" => Some(Self::Up),
+            "d" | "down" => Some(Self::Down),
+            "n" | "north" => Some(Self::North),
+            "s" | "south" => Some(Self::South),
+            "w" | "west" => Some(Self::West),
+            "e" | "east" => Some(Self::East),
+            _ => None,
+        }
+    }
+
+    pub fn from_yaw_pitch(yaw: f32, pitch: f32) -> Self {
+        if pitch <= -67.5 {
+            return Self::Up;
+        }
+        if pitch >= 67.5 {
+            return Self::Down;
+        }
+
+        match yaw.rem_euclid(360.0) {
+            y if (45.0..135.0).contains(&y) => Self::West,
+            y if (135.0..225.0).contains(&y) => Self::North,
+            y if (225.0..315.0).contains(&y) => Self::East,
+            _ => Self::South,
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Up => Self::Down,
+            Self::Down => Self::Up,
+            Self::North => Self::South,
+            Self::South => Self::North,
+            Self::West => Self::East,
+            Self::East => Self::West,
+        }
+    }
+
+    fn vector(self) -> (i32, i32, i32) {
+        match self {
+            Self::Up => (0, 1, 0),
+            Self::Down => (0, -1, 0),
+            Self::North => (0, 0, -1),
+            Self::South => (0, 0, 1),
+            Self::West => (-1, 0, 0),
+            Self::East => (1, 0, 0),
+        }
+    }
+}
+
 /// A player's current selection corners. Either or both may be unset.
 #[derive(Default, Clone, Copy)]
 pub struct Selection {
@@ -54,6 +117,49 @@ impl Region {
         let dy = (self.max.y - self.min.y + 1) as usize;
         let dz = (self.max.z - self.min.z + 1) as usize;
         dx * dy * dz
+    }
+
+    /// Expand one face of the region by `amount` blocks in `direction`.
+    /// Negative amounts shrink that face. Returns `None` if the region would
+    /// invert.
+    pub fn expanded(self, amount: i32, direction: Direction) -> Option<Self> {
+        let mut out = self;
+        match direction {
+            Direction::Up => out.max.y = out.max.y.checked_add(amount)?,
+            Direction::Down => out.min.y = out.min.y.checked_sub(amount)?,
+            Direction::North => out.min.z = out.min.z.checked_sub(amount)?,
+            Direction::South => out.max.z = out.max.z.checked_add(amount)?,
+            Direction::West => out.min.x = out.min.x.checked_sub(amount)?,
+            Direction::East => out.max.x = out.max.x.checked_add(amount)?,
+        }
+        (out.min.x <= out.max.x && out.min.y <= out.max.y && out.min.z <= out.max.z).then_some(out)
+    }
+
+    /// Contract the side opposite `direction`, matching WorldEdit's
+    /// `//contract`: contracting down shrinks from the top, contracting north
+    /// shrinks from the south, and so on.
+    pub fn contracted(self, amount: i32, direction: Direction) -> Option<Self> {
+        self.expanded(-amount, direction.opposite())
+    }
+
+    /// Move the selection without changing its size.
+    pub fn shifted(self, amount: i32, direction: Direction) -> Option<Self> {
+        let (dx, dy, dz) = direction.vector();
+        let ox = dx.checked_mul(amount)?;
+        let oy = dy.checked_mul(amount)?;
+        let oz = dz.checked_mul(amount)?;
+        Some(Self {
+            min: BlockPos {
+                x: self.min.x.checked_add(ox)?,
+                y: self.min.y.checked_add(oy)?,
+                z: self.min.z.checked_add(oz)?,
+            },
+            max: BlockPos {
+                x: self.max.x.checked_add(ox)?,
+                y: self.max.y.checked_add(oy)?,
+                z: self.max.z.checked_add(oz)?,
+            },
+        })
     }
 
     /// Visit every block position in the region in `x, z, y` order, calling
@@ -105,6 +211,14 @@ pub fn with_selection_mut<T>(key: &str, f: impl FnOnce(&mut Selection) -> T) -> 
     SELECTIONS.with_borrow_mut(|map| f(map.entry(key.to_string()).or_default()))
 }
 
+/// Replace a player's current selection with a normalized region.
+pub fn set_region(key: &str, region: Region) {
+    with_selection_mut(key, |sel| {
+        sel.pos1 = Some(region.min);
+        sel.pos2 = Some(region.max);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +267,42 @@ mod tests {
             pos2: Some(at(1, 1, 1)),
         };
         assert!(sel.region().is_some());
+    }
+
+    #[test]
+    fn parses_direction_aliases() {
+        assert_eq!(Direction::parse("u"), Some(Direction::Up));
+        assert_eq!(Direction::parse("north"), Some(Direction::North));
+        assert_eq!(Direction::parse("bad"), None);
+    }
+
+    #[test]
+    fn derives_direction_from_yaw_pitch() {
+        assert_eq!(Direction::from_yaw_pitch(0.0, 0.0), Direction::South);
+        assert_eq!(Direction::from_yaw_pitch(90.0, 0.0), Direction::West);
+        assert_eq!(Direction::from_yaw_pitch(180.0, 0.0), Direction::North);
+        assert_eq!(Direction::from_yaw_pitch(270.0, 0.0), Direction::East);
+        assert_eq!(Direction::from_yaw_pitch(0.0, -80.0), Direction::Up);
+        assert_eq!(Direction::from_yaw_pitch(0.0, 80.0), Direction::Down);
+    }
+
+    #[test]
+    fn expands_contracts_and_shifts_regions() {
+        let r = Region::new(at(0, 0, 0), at(2, 2, 2));
+        let expanded = r.expanded(3, Direction::East).unwrap();
+        assert_eq!((expanded.min.x, expanded.max.x), (0, 5));
+
+        let contracted = r.contracted(1, Direction::Down).unwrap();
+        assert_eq!((contracted.min.y, contracted.max.y), (0, 1));
+
+        let shifted = r.shifted(4, Direction::North).unwrap();
+        assert_eq!((shifted.min.z, shifted.max.z), (-4, -2));
+    }
+
+    #[test]
+    fn rejecting_over_contract_keeps_region_valid() {
+        let r = Region::new(at(0, 0, 0), at(2, 2, 2));
+        assert!(r.contracted(2, Direction::Down).is_some());
+        assert!(r.contracted(3, Direction::Down).is_none());
     }
 }

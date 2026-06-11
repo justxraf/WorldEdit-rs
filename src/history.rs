@@ -12,10 +12,10 @@
 //! purely in-memory and caps the number of *entries* (not blocks), which is
 //! fine for small/medium edits but not a full replacement.
 //!
-//! TODO(FAWE parity): `//undo [times] [player]` and `//redo [times] [player]`
-//! support an optional `player` argument so operators can undo another
-//! player's edits. Not implemented — only the invoking player's own stack is
-//! addressable here.
+//! `//undo [times] [player]` and `//redo [times] [player]` can address another
+//! player's in-memory stack by key. Unlike FAWE, edit entries do not store a
+//! source world, so commands still apply through the invoking player's current
+//! world.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -99,7 +99,6 @@ pub fn redo(key: &str) -> Option<EditEntry> {
 }
 
 /// Clear both stacks for a player (`//clearhistory`).
-#[allow(dead_code)]
 pub fn clear(key: &str) {
     HISTORY.with_borrow_mut(|map| {
         map.remove(key);
