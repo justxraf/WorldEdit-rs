@@ -12,6 +12,7 @@
 //! where a single Pumpkin command contains multiple WorldEdit subcommands that
 //! need handler-level checks.
 
+mod brush;
 mod clearclipboard;
 mod clearhistory;
 mod copy;
@@ -47,6 +48,57 @@ const PERMISSION_NAMESPACE: &str = "worldedit-rs";
 /// Register every `//` command and its permission node.
 pub fn register(context: &Context) {
     for (node, description) in [
+        (
+            "worldedit-rs:command.brush",
+            "Allows using the //brush and //br dispatcher.",
+        ),
+        ("worldedit.brush.sphere", "Allows binding the sphere brush."),
+        (
+            "worldedit.brush.cylinder",
+            "Allows binding the cylinder brush.",
+        ),
+        ("worldedit.brush.set", "Allows binding the set brush."),
+        (
+            "worldedit.brush.clipboard",
+            "Allows binding the clipboard brush.",
+        ),
+        ("worldedit.brush.smooth", "Allows binding the smooth brush."),
+        (
+            "worldedit.brush.gravity",
+            "Allows binding the gravity brush.",
+        ),
+        ("worldedit.brush.ex", "Allows binding the extinguish brush."),
+        (
+            "worldedit.brush.splatter",
+            "Allows binding the splatter brush.",
+        ),
+        ("worldedit.brush.raise", "Allows binding the raise brush."),
+        ("worldedit.brush.lower", "Allows binding the lower brush."),
+        (
+            "worldedit.brush.morph",
+            "Allows binding erode, dilate, and morph brushes.",
+        ),
+        ("worldedit.brush.snow", "Allows binding the snow brush."),
+        (
+            "worldedit.brush.options.size",
+            "Allows changing a bound brush's size.",
+        ),
+        (
+            "worldedit.brush.options.material",
+            "Allows changing a bound brush's material.",
+        ),
+        (
+            "worldedit.brush.options.mask",
+            "Allows changing a bound brush's mask.",
+        ),
+        (
+            "worldedit.brush.options.range",
+            "Allows changing a bound brush's range.",
+        ),
+        (
+            "worldedit.brush.options.tracemask",
+            "Allows changing a bound brush's trace mask.",
+        ),
         (
             "worldedit.selection.pos",
             "Allows setting selection points with //pos1 and //pos2.",
@@ -183,13 +235,14 @@ pub fn register(context: &Context) {
     shell::register(context);
     wand::register(context);
     schematic::register(context);
+    brush::register(context);
 
     logging::log(
         LogLevel::Info,
         "WorldEdit-rs: //pos1, //pos2, //hpos1, //hpos2, //sel, //set, //replace, //copy, //cut, \
          //paste, //undo, //redo, //size, //clearclipboard, //clearhistory, //expand, //contract, \
          //shift, //outset, //inset, //count, //walls, //faces, //outline, //wand, //schematic \
-         (//schem) registered.",
+         (//schem), //brush (//br) registered.",
     );
 }
 
@@ -266,8 +319,9 @@ pub fn require_selection(
 /// Block-update flags for bulk edits: force the state, skip drops, and skip
 /// per-block callbacks/physics to keep large operations quiet and fast.
 ///
-/// TODO(FAWE parity): FAWE exposes this as the "side effects" / `-n` toggle
-/// on commands like `//set` and `//paste`. Here it is always on.
+/// FAWE exposes this as the "side effects" / `-n` toggle on commands like
+/// `//set` and `//paste`. WorldEdit-rs currently uses quiet bulk-edit flags
+/// globally; `//set -n` is accepted for command compatibility.
 pub fn block_flags() -> BlockFlags {
     BlockFlags::SKIP_DROPS
         | BlockFlags::FORCE_STATE
