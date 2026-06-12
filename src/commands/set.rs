@@ -15,7 +15,12 @@ use pumpkin_plugin_api::{
     world::BlockChange,
 };
 
-use crate::{history, history::EditEntry, mapping, pattern::BlockPattern};
+use crate::{
+    history,
+    history::EditEntry,
+    mapping,
+    pattern::{BlockPattern, PatternEvalContext},
+};
 
 use super::{batch_size, block_flags, command_names, require_selection};
 
@@ -65,6 +70,11 @@ impl pumpkin_plugin_api::commands::CommandHandler for SetCommand {
                 return Ok(0);
             }
         };
+        let pattern_ctx = PatternEvalContext::for_player(region.min, &key);
+        if let Err(message) = pattern.validate(&pattern_ctx) {
+            sender.send_error(TextComponent::text(&message));
+            return Ok(0);
+        }
 
         let started = std::time::Instant::now();
         let mut placed = 0usize;
@@ -73,7 +83,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for SetCommand {
             let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
             for &pos in batch {
                 let before = world.get_block_state_id(pos);
-                let state_id = pattern.state_at(pos, before);
+                let state_id = pattern.state_at_with(pos, before, &pattern_ctx);
                 if before == state_id {
                     continue;
                 }

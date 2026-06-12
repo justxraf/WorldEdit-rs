@@ -13,7 +13,11 @@ use pumpkin_plugin_api::{
     world::BlockChange,
 };
 
-use crate::{clipboard, history, history::EditEntry, pattern::BlockPattern};
+use crate::{
+    clipboard, history,
+    history::EditEntry,
+    pattern::{BlockPattern, PatternEvalContext},
+};
 
 use super::{batch_size, block_flags, command_names, require_selection, sender_block_pos};
 
@@ -62,6 +66,11 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         let buffer = clipboard::capture(&world, &region, origin);
         let copied = buffer.blocks.len();
         clipboard::set(&key, buffer);
+        let pattern_ctx = PatternEvalContext::for_player(region.min, &key);
+        if let Err(message) = leave_pattern.validate(&pattern_ctx) {
+            sender.send_error(TextComponent::text(&message));
+            return Ok(0);
+        }
 
         let mut cleared = 0usize;
         let mut entry = EditEntry::default();
@@ -69,7 +78,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
             let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
             for &pos in batch {
                 let before = world.get_block_state_id(pos);
-                let leave_state = leave_pattern.state_at(pos, before);
+                let leave_state = leave_pattern.state_at_with(pos, before, &pattern_ctx);
                 if before == leave_state {
                     continue;
                 }

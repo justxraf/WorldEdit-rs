@@ -3,10 +3,14 @@
 //!
 //! Mirrors WorldEdit's `ToolCommands#wand` and the default `WAND_ITEM`
 //! (a wooden axe): left-click a block to set position 1, right-click a block
-//! to set position 2. Both clicks are cancelled so the wand never breaks or
-//! places blocks — left-click is cancelled via [`BlockBreakEvent`] (the
-//! [`PlayerInteractEvent`] for `LeftClickBlock` doesn't gate breaking) and
-//! right-click via [`PlayerInteractEvent`].
+//! to set position 2. Left-click is cancelled via [`BlockBreakEvent`] (the
+//! [`PlayerInteractEvent`] for `LeftClickBlock` doesn't gate breaking) so the
+//! wand never breaks the targeted block. Right-click is *not* cancelled: a
+//! wooden axe has no placement or right-click behaviour of its own, so the
+//! interaction is already a no-op, and cancelling it triggers a Pumpkin host
+//! bug where the revert `CBlockUpdate` sends the block's registry id instead
+//! of its block-state id — for `grass_block` that id aliases `snowy=true`,
+//! making the clicked block flash as "snowy grass" client-side.
 //!
 //! WorldEdit's wand item is configurable (`wand-item` in
 //! `worldedit.properties`) and FAWE also supports `//wand -n` for a navigation
@@ -125,7 +129,7 @@ impl EventHandler<PlayerInteractEvent> for WandInteractHandler {
     fn handle(
         &self,
         _server: pumpkin_plugin_api::Server,
-        mut data: pumpkin_plugin_api::events::EventData<PlayerInteractEvent>,
+        data: pumpkin_plugin_api::events::EventData<PlayerInteractEvent>,
     ) -> pumpkin_plugin_api::events::EventData<PlayerInteractEvent> {
         let Some(pos) = data.clicked_pos else {
             return data;
@@ -152,7 +156,6 @@ impl EventHandler<PlayerInteractEvent> for WandInteractHandler {
             false,
         );
 
-        data.cancelled = true;
         data
     }
 }

@@ -72,7 +72,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for UndoCommand {
             _ => 1,
         };
         let key = match args.get_value("player") {
-            Arg::Simple(player) => player,
+            Arg::Simple(player) if !player.is_empty() => player,
             _ => sender_key,
         };
 
