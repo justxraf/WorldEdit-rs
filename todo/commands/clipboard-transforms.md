@@ -6,6 +6,8 @@
       pastes)
 - [ ] `//flip [direction]` (mirrors the clipboard's future pastes across an
       axis; defaults to the player's facing direction)
+- [ ] `//place [-a] [-o] [-s] [-n] [-e] [-b] [-x]` (paste ignoring the
+      clipboard's pending rotate/flip transform)
 
 ## Current State
 
@@ -32,6 +34,17 @@ transform is already attached to the `ClipboardHolder` via
 is applied lazily, only when the clipboard is **pasted** - repeated
 `//rotate`/`//flip` calls compose. `//rotate` takes the Y-axis angle as a
 required argument, with optional X and Z angles (both default `0`).
+
+FAWE additionally provides **`//place [-a] [-o] [-s] [-n] [-e] [-b] [-x]`**
+(`ClipboardCommands.place`), a paste variant that **ignores the clipboard
+holder's accumulated transform entirely** - it pastes the raw, untransformed
+buffer. By default it targets the placement position (see
+[terrain-and-radius-tools.md](terrain-and-radius-tools.md)); `-o` targets the
+clipboard's stored origin instead. `-n` selects the region the paste *would*
+occupy without actually pasting (implies `-s`); `-x` removes existing entities
+in the affected region first; `-a`/`-s`/`-e`/`-b` mirror `//paste`'s flags.
+This is the escape hatch for "I rotated/flipped the clipboard for other
+pastes, but want one paste without that transform."
 
 ## API Capability
 
@@ -78,6 +91,13 @@ bounding-box center) and each block's *state properties*.
 - [ ] `//paste` already reads clipboard bounds via `clipboard::bounds`/
       `target_region` - verify these are recomputed from the *transformed*
       bounding box when a non-identity transform is set.
+- [ ] `//place`: factor `//paste`'s "apply transform then blit buffer" step
+      into a helper that takes an explicit `Transform` (identity for
+      `//place`, the stored transform for `//paste`), so both commands share
+      the blit/selection-update logic. `-o` targets the clipboard's stored
+      origin instead of the placement position; other flags (`-a`, `-s`, `-n`,
+      `-e`, `-b`, `-x`) mirror whichever of `//paste`'s flags are already
+      implemented.
 - [ ] Add tests: round-trip rotate 4x90 == identity, flip twice == identity,
       composing rotate-then-flip matches FAWE's `combine` order, and a known
       oriented block (e.g. `oak_stairs[facing=north]`) rotates to the expected

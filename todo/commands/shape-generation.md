@@ -7,6 +7,7 @@
 - [ ] `//cyl <pattern> <radius>[,<radius-z>] [height] [-h]`
 - [ ] `//hcyl <pattern> <radius>[,...] [height] [thickness]` (hollow cylinder)
 - [ ] `//pyramid <pattern> <size> [-h]` (alias `//hpyramid` for hollow)
+- [ ] `//cone <pattern> <radii>[,<radius-z>] [height] [-h] [thickness]`
 - [ ] `//line <pattern> [thickness]` (draws a line between `pos1` and `pos2`)
 - [ ] `//curve <pattern> [thickness]` (draws a curve through a `convex`
       selection's points)
@@ -22,8 +23,10 @@ bounding box.
 These are among the most-used WorldEdit commands (quick terrain features,
 domes, pillars, hills). They're also a good first addition because, unlike
 most other gaps, they don't require a pre-existing selection - WorldEdit
-centers them on the player's position (or `pos1`/`pos2` for `//line`/
-`//curve`) and *creates* a region afterward.
+centers them on the placement position (the player's position by default, or
+`pos1` after `//toggleplace` - see
+[navigation-and-tools.md](navigation-and-tools.md)), or `pos1`/`pos2` for
+`//line`/`//curve`, and *creates* a region afterward.
 
 ## API Capability
 
@@ -49,6 +52,16 @@ already use.
 - **`//hcyl`**: takes an additional `thickness` argument (default `0`) for
   wall thickness.
 - **`//pyramid`**: `<pattern> <size>`, with `-h` for hollow.
+- **`//cone <pattern> <radii> [height] [-h] [thickness]`** (from
+  `GenerationCommands.cone`/`EditSession.makeCone`): `radii` uses the same
+  one-or-two-comma-separated-values syntax as `//cyl` (N/S radius, E/W radius,
+  each clamped to a minimum of `1`). `height` defaults to `1`; a negative
+  height builds the cone downward from the placement position instead of
+  upward. `-h` makes it hollow with wall `thickness` (default `1`).
+  Membership at layer `y` (0 = base): the horizontal ellipse radii shrink
+  linearly from `(radiusX, radiusZ)` at the base to `0` at the apex (layer
+  `height - 1`) - the same linear taper as `//pyramid`, but with `//cyl`'s
+  elliptical cross-section instead of a square one.
 - All generation commands enforce a maximum radius/size (server-configurable
   in FAWE) and can trigger the player's "unstuck" placement if they'd
   otherwise be generated inside the player.
@@ -72,6 +85,13 @@ already use.
       `thickness = 1` for sphere, configurable for cylinder).
 - [ ] `[raised]`/`-r`: shift the shape's vertical center so its bottom is at
       the target Y instead of the center being at the target Y.
+- [ ] `//cone`: reuse the cylinder's elliptical cross-section test
+      `(dx/rx)^2 + (dz/rz)^2 <= 1`, but scale `rx`/`rz` by `(1 - y/height)` at
+      each layer `y` (the same linear-taper formula as `//pyramid`, applied to
+      an ellipse instead of a square). Negative `height` builds downward from
+      the placement position. Hollow (`-h`) follows the same "in shape at the
+      full radius but not at `radius - thickness`" rule as `//hsphere`/
+      `//hcyl`, default `thickness = 1`.
 - [ ] `//line`/`//curve`: rasterize a 3D line (DDA/Bresenham-style walk)
       between `pos1`/`pos2` (line) or through each consecutive pair of
       `convex` selection points (curve, from

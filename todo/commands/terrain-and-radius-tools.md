@@ -12,6 +12,9 @@
 - [ ] `//removeabove [size] [height]` / `//removebelow [size] [depth]`
 - [ ] `//removenear <mask> [radius]`
 - [ ] `//replacenear <radius> <from> <to>`
+- [ ] `//fill <pattern> <radius> [depth] [direction]`
+- [ ] `//fillr <pattern> <radius> [depth]`
+- [ ] `//toggleplace`
 
 ## Current State
 
@@ -46,11 +49,33 @@ around the player or within a selection, without a full region edit.
   square radius (default `50`) of the player; FAWE narrows the working region
   to the mask's bounds first for performance.
 - **`//replacenear <radius> <from> <to>`**: `//replace`-equivalent restricted
-  to a cuboid of the given radius around the player. If `from` is omitted,
-  defaults to matching whatever block is already present at each position
-  (i.e. behaves like `//set` within the radius) - confirm this default
-  precisely before implementing, since it differs from `//replace`'s "all
-  non-air" default.
+  to a cuboid of side `2*radius+1` centered on the placement position.
+  **Confirmed against `UtilityCommands.replaceNear`**: if `from` is omitted it
+  defaults to `ExistingBlockMask` - the **same** "all non-air" default as
+  `//replace`'s no-`from` form, not a `//set`-like "match whatever's there"
+  behavior.
+- **`//fill <pattern> <radius> [depth] [direction=down]`**: from the placement
+  position, fills holes with `pattern`. `radius` and `depth` (default `1`)
+  both clamp to a minimum of `1`. For the default `direction=down`, this is a
+  non-recursive per-column fill (`fillXZ`, `recursive=false`): for each
+  `(x, z)` within an ellipsoid `radius` of the origin's column, scan downward
+  from the origin's Y for up to `depth` blocks, filling air with `pattern` and
+  stopping at the first non-air block in that column. For any other
+  `direction`, it's a directional BFS flood through connected air starting at
+  the origin, bounded by the same ellipsoid plus `2*radius+1` steps along
+  `direction`.
+- **`//fillr <pattern> <radius> [depth]`**: same as `//fill` with
+  `direction=down`, but `recursive=true` - a full BFS flood-fill through *all*
+  connected air within the bounding ellipsoid/depth (not just straight down
+  each column). `depth` is optional with no real cap (effectively unbounded).
+- **Placement position / `//toggleplace`**: every command in this doc (plus
+  the shape-generation commands in
+  [shape-generation.md](shape-generation.md)) operates at
+  `session.getPlacementPosition(actor)`, which defaults to the player's feet
+  but can be pinned to `pos1` via `//toggleplace` - see
+  [navigation-and-tools.md](navigation-and-tools.md). "Centered on the player"
+  throughout this doc should be read as "centered on the placement position
+  (player by default)".
 - **`//naturalize`**: re-layers each column - the surface becomes grass, the
   next several layers (FAWE uses 3) become dirt, and everything below becomes
   stone.
@@ -119,8 +144,27 @@ Two host functions help significantly:
       [mask-coverage-and-global-mask.md](mask-coverage-and-global-mask.md)) to
       air.
 - [ ] `//replacenear <radius> <from> <to>`: `//replace`'s logic restricted to a
-      player-centered cube of side `2*radius+1` - confirm the no-`from`
-      default against real FAWE before shipping.
+      placement-position-centered cube of side `2*radius+1`; no-`from` ->
+      `BlockMask::Not(Box::new(BlockMask::Air))`, same as `//replace`'s
+      one-arg form.
+- [ ] `//fill <pattern> <radius> [depth] [direction=down]`: `direction=down`
+      (default): for each `(x, z)` column with
+      `(dx/radius)^2 + (dz/radius)^2 <= 1` relative to the origin, scan down
+      from `origin.y` for up to `depth` blocks, filling air with `pattern` and
+      stopping at the first non-air block in that column (or world floor /
+      `depth`, whichever comes first). Any other `direction`: BFS flood-fill
+      through air starting at the origin, bounded by
+      `(dx/radius)^2+(dy/radius)^2+(dz/radius)^2<=1` and `2*radius+1` steps
+      along `direction`, replacing each visited air block with `pattern`.
+- [ ] `//fillr <pattern> <radius> [depth]`: like `//fill` with
+      `direction=down`, but BFS-flood through *all* connected air within the
+      bounding ellipsoid/depth instead of stopping each column at its first
+      non-air block - likely shares a flood-fill helper with `//drain`/
+      `//fixwater` above.
+- [ ] `//toggleplace`: see [navigation-and-tools.md](navigation-and-tools.md)
+      for the shared `placement_position(sender)` helper this and the
+      shape-generation commands should use instead of `sender_block_pos`
+      directly.
 - [ ] All of these should push a single `EditEntry` to `history` like existing
       commands, and use `batch_size()`/`block_flags()` for consistency.
 - [ ] Add tests for the pure math/classification helpers (fluid-state

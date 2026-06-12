@@ -9,6 +9,7 @@
 - [ ] `//descend [levels]`
 - [ ] `//ceil [clearance]`
 - [ ] `//unstuck`
+- [ ] `//toggleplace`
 - [ ] `//tool <none|repl|farwand|tree|...> [args]`
 - [ ] super pickaxe (`//,` / `//superpickaxe` toggle + single/area/recursive
       modes)
@@ -53,6 +54,14 @@ brush dispatcher's plumbing.
   (required argument, no default), optionally placing a temporary glass
   platform if the destination would otherwise be air (`alwaysGlass` /
   fly-mode dependent). Failure: "worldedit.up.obstructed".
+- **`//toggleplace`** (from `GeneralCommands.togglePlace`): toggles each
+  player's "placement position" between their current feet position (default)
+  and `pos1`. The placement position is the shared origin used by the
+  shape-generation commands ([shape-generation.md](shape-generation.md)),
+  `//fill`/`//fillr` and the player-radius terrain commands
+  ([terrain-and-radius-tools.md](terrain-and-radius-tools.md)) - those docs'
+  "centered on the player" should be read as "centered on the placement
+  position, which defaults to the player".
 
 ## API Capability
 
@@ -95,6 +104,14 @@ Fully implementable today:
 - [ ] `//unstuck`: if the player's current position is inside a solid block,
       scan outward (small radius, then upward) for the nearest non-solid
       position and teleport there.
+- [ ] `//toggleplace`: add a per-player `bool` (thread-local, alongside
+      `SELECTIONS`/`CLIPBOARDS`/etc.), defaulting to `false` (= use player
+      position). Add a shared `placement_position(sender) -> Result<BlockPos,
+      ()>` helper in `src/commands/mod.rs` that returns `pos1` when the flag
+      is set (error "Set //pos1 first" if unset) or `sender_block_pos(sender)`
+      otherwise; have the [shape-generation.md](shape-generation.md) and
+      [terrain-and-radius-tools.md](terrain-and-radius-tools.md) commands call
+      this helper instead of `sender_block_pos` directly.
 - [ ] `//tool none|repl|farwand|tree|...`: bind a tool to the player's
       currently-held item, mirroring `brush::BrushKind`'s
       bind/dispatch/per-player-thread-local-state pattern. Start with `none`

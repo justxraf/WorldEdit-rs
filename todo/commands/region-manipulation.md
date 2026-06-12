@@ -43,9 +43,21 @@ selection, leaving a shell - useful for buildings.
   region-size multiples. `-s`/`-a`/`-m` behave as in `//move`.
 - **`//overlay <pattern>`**: for each `(x, z)` column in the selection, finds
   the highest non-air block and places `pattern` one block above it.
-- **`//hollow [thickness] [pattern] [-m mask]`**: thickness defaults to `0`;
-  replacement pattern defaults to air. An optional mask restricts which
-  existing blocks are eligible to become hollowed-out interior.
+- **`//hollow [thickness] [pattern] [-m mask]`**: thickness defaults to `0`
+  (manhattan-distance shell thickness); replacement pattern defaults to air.
+  **Confirmed against `EditSession.hollowOutRegion`/`recurseHollow`**: the
+  algorithm is a 6-connected BFS flood-fill inward from the selection
+  bounding box's six outer faces. A position stops the flood (and counts as
+  "shell") if `mask.test(position)` is `true`; everywhere the flood reaches is
+  "outside" and gets `pattern` applied in the final pass unless one of its
+  6-neighbors is shell. **The default mask (no `-m`) is `SolidBlockMask`** -
+  i.e. by default only solid blocks count as shell, and the flood propagates
+  freely through air/liquid. `thickness = 0` does **not** mean "hollow
+  nothing" - it still produces the ~1-block solid shell found by the
+  single-pass flood fill; `thickness > 1` repeats an extra "peel" pass that
+  pulls additional region positions into `outside` before the final shell
+  check, thickening the kept shell. An optional `-m mask` replaces
+  `SolidBlockMask` as the "what counts as shell" test.
 - **`//naturalize`** and **`//smooth`** are covered in
   [terrain-and-radius-tools.md](terrain-and-radius-tools.md), not here.
 - **`//deform <expression>`**: applies a coordinate-transform expression to
@@ -96,14 +108,21 @@ See [README.md's capability table](README.md#quick-reference-pumpkin-api-capabil
       downward from `region.max.y` for the highest non-air block whose Y is
       within the selection's Y range, and set `pattern` one block above it
       (only if that position is also within the selection).
-- [ ] `//hollow [thickness] [pattern] [-m mask]`: a block is "interior" (and
-      gets replaced by `pattern`, default air) if it is more than `thickness`
-      blocks from every face of the selection's bounding box. For
-      `thickness = 0` (the FAWE default), every block is interior except where
-      `thickness` would otherwise be `0` and... confirm FAWE's exact `0`
-      semantics (whether `0` hollows everything or nothing) against real
-      WorldEdit before locking in the default. An optional `mask` further
-      restricts which positions are eligible to be hollowed.
+- [ ] `//hollow [thickness] [pattern] [-m mask]`: port FAWE's flood-fill
+      algorithm rather than a bounding-box-distance heuristic (the geometric
+      shortcut diverges for non-cuboid/irregular "objects" inside the
+      selection and for custom masks, which is `//hollow`'s actual point - see
+      its javadoc: "Hollows out the object contained in this selection").
+      Implementation: BFS from the bounding box's six outer faces inward
+      through `region`; a position joins an `outside` set if `!shell_mask(pos)`
+      (default `shell_mask = is_solid(state)`, override via `-m`), and its
+      6-neighbors are queued next - a position where `shell_mask(pos)` is true
+      stops the flood there without joining `outside`. For `thickness > 1`,
+      repeat `thickness - 1` extra passes that add any `region` position with a
+      neighbor already in `outside` to `outside` too (thickening the shell).
+      Final pass: for every position in `region`, apply `pattern` (default
+      air) unless at least one of its 6-neighbors is in `outside` (i.e. it's
+      shell - skip it).
 - [ ] Add tests: `//move`/`//stack` offset math for each `Direction` variant
       (reuse `src/selection.rs`'s existing direction parsing/vector helpers),
       `//overlay` column scanning with gaps/overhangs, and `//hollow` interior

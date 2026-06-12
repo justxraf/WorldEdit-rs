@@ -26,18 +26,18 @@ Findings here are grounded in three things:
   (sphere, cylinder, polygon, convex, ellipsoid) and the region/iteration
   changes they require. Foundational for several other docs below.
 - [shape-generation.md](shape-generation.md) - `//sphere`, `//hsphere`,
-  `//cyl`, `//hcyl`, `//pyramid`/`//hpyramid`, `//line`, `//curve`.
+  `//cyl`, `//hcyl`, `//cone`, `//pyramid`/`//hpyramid`, `//line`, `//curve`.
 - [clipboard-transforms.md](clipboard-transforms.md) - `//rotate`, `//flip`,
-  and the block-state orientation transform they need.
+  `//place`, and the block-state orientation transform they need.
 - [region-manipulation.md](region-manipulation.md) - `//move`, `//stack`,
   `//overlay`, `//hollow`, `//deform`, `//regen`.
 - [terrain-and-radius-tools.md](terrain-and-radius-tools.md) - `//smooth`,
   `//naturalize`, `//green`, `//snow`, `//thaw`, `//drain`, `//fixwater`,
   `//fixlava`, `//removeabove`, `//removebelow`, `//removenear`,
-  `//replacenear`.
+  `//replacenear`, `//fill`/`//fillr`.
 - [navigation-and-tools.md](navigation-and-tools.md) - `//jumpto`, `//thru`,
-  `//up`, `//ascend`, `//descend`, `//ceil`, `//unstuck`, `//tool`, super
-  pickaxe.
+  `//up`, `//ascend`, `//descend`, `//ceil`, `//unstuck`, `//toggleplace`,
+  `//tool`, super pickaxe.
 - [entity-and-biome-commands.md](entity-and-biome-commands.md) - `//butcher`,
   `//remove`, `//setbiome`, and the `#biome` pattern.
 - [mask-coverage-and-global-mask.md](mask-coverage-and-global-mask.md) -

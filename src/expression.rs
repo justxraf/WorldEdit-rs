@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::rc::Rc;
 
 use pumpkin_plugin_api::common::BlockPos;
@@ -104,7 +105,7 @@ impl Expr {
             Self::Binary { op, left, right } => match op {
                 BinaryOp::LogicalOr => {
                     let left = left.eval(ctx)?;
-                    if truthy(left) {
+                    if truthy(left).0 {
                         Ok(1.0)
                     } else {
                         Ok(truthy(right.eval(ctx)?).as_f64())
@@ -112,7 +113,7 @@ impl Expr {
                 }
                 BinaryOp::LogicalAnd => {
                     let left = left.eval(ctx)?;
-                    if !truthy(left) {
+                    if !truthy(left).0 {
                         Ok(0.0)
                     } else {
                         Ok(truthy(right.eval(ctx)?).as_f64())
@@ -144,7 +145,7 @@ impl Expr {
                 on_true,
                 on_false,
             } => {
-                if truthy(condition.eval(ctx)?) {
+                if truthy(condition.eval(ctx)?).0 {
                     on_true.eval(ctx)
                 } else {
                     on_false.eval(ctx)
@@ -820,7 +821,7 @@ fn query(args: &[Expr], ctx: &mut EvalContext<'_>, mode: QueryMode) -> Result<f6
         },
     };
 
-    let state_id = if target == ctx.pos {
+    let state_id = if target.x == ctx.pos.x && target.y == ctx.pos.y && target.z == ctx.pos.z {
         Some(ctx.before)
     } else {
         ctx.ctx.sample_block_state(target)

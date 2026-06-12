@@ -47,10 +47,12 @@ box.
       matches FAWE's two-click sphere/cylinder selectors.
 - [ ] `//sel poly [points]`: 2D polygon defined by repeated clicks (each
       `//pos1`-like click after the first appends a point instead of
-      replacing `pos1`), extruded from `MIN_BUILD_Y` to `MAX_BUILD_Y` (or the
-      min/max Y across the clicked points - confirm FAWE's exact Y-extent
-      behavior before locking this in). `contains` is a 2D point-in-polygon
-      test on `(x, z)`.
+      replacing `pos1`). **Y-extent (confirmed against
+      `Polygonal2DRegionSelector`)**: NOT `MIN_BUILD_Y`/`MAX_BUILD_Y` - every
+      clicked point calls `region.expandY(point.y)`, so the region's `min.y`/
+      `max.y` track the lowest/highest Y among all clicked points so far and
+      grow dynamically as more points are added. `contains` is a 2D
+      point-in-polygon test on `(x, z)` AND'd with `min.y <= y <= max.y`.
 - [ ] `//sel convex`: convex polyhedron hull from clicked points; `contains`
       needs a half-space test per hull face. This is the most complex shape -
       implement it last, and reuse the point list for `//curve`
