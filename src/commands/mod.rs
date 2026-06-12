@@ -86,7 +86,7 @@ pub fn register(context: &Context) {
         ("worldedit.brush.lower", "Allows binding the lower brush."),
         (
             "worldedit.brush.morph",
-            "Allows binding erode, dilate, and morph brushes.",
+            "Allows binding erode, pull, dilate, and morph brushes.",
         ),
         ("worldedit.brush.snow", "Allows binding the snow brush."),
         (

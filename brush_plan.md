@@ -93,14 +93,22 @@ Priority: P3. Improve parity, usability, and safety after the block-capable brus
 ## Implementation order
 
 - [x] 1. Audit current implementation and constraints.
-- [ ] 2. Audit FAWE source/docs for exact brush names, aliases, defaults, and flags.
+- [x] 2. Audit FAWE source/docs for exact brush names, aliases, defaults, and flags.
 - [x] 3. Extend parser, literals, and binding state before adding new apply functions.
 - [x] 4. Add shared helpers for targeting, surfaces, scatter, and noise-driven positions.
 - [ ] 5. Implement P1 block-capable brushes first: shape parity, clipboard expansion, flatten, terrain tools, height/heightmap.
 - [ ] 6. Implement P2 advanced block-capable brushes: scatter, overlay/surface, spline family, shatter, populate schematic.
 - [x] 7. Add or expand tests for parsing, binding persistence, and apply behavior.
 - [x] 8. Fill out permissions, usage text, and unsupported error messages.
-- [ ] 9. Add docstrings and command help text that match the supported FAWE subset accurately.
+- [x] 9. Add docstrings and command help text that match the supported FAWE subset accurately.
+
+## Phase 1 audit notes
+
+- [x] Audited the local `FastAsyncWorldEdit` `worldedit-core` implementation instead of external docs for faster parity checks.
+- [x] Confirmed FAWE aliases/defaults currently mirrored in WorldEdit-rs Phase 1: `blendball`/`bb`/`blend`, `surface`/`surf`, `scattercommand`/`scattercmd`/`scmd`/`scommand`, `surfacespline`/`sspline`/`sspl`, `catenary`/`cat`/`gravityline`/`saggedline`, `populateschematic`/`populateschem`/`popschem`/`pschem`/`ps`, and `flatten`/`flat`/`flatmap`.
+- [x] Confirmed FAWE terrain-family naming: `height` also covers `heightmap`, while `cliff` / `flatcylinder` are separate FAWE-facing terrain aliases. WorldEdit-rs now recognizes the `cliff` naming on the flatten path.
+- [x] Confirmed FAWE tool-option naming differences that matter for Phase 1 help text: `target` exposes the same four target enum modes, `scroll` supports `none|clipboard|mask|pattern|target_offset|range|size|target`, and FAWE's `tracemask` aliases differ from the extra stub state WorldEdit-rs stores today.
+- [x] Documented intentional Phase 1 deviations in command help: Pumpkin keeps `clipboard` as the supported paste brush while FAWE's `copypaste`, image-backed `stencil` / `image`, and other richer brush families stay recognized-but-unsupported until later phases.
 
 ## Notes for future passes
 

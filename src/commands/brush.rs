@@ -1,11 +1,31 @@
 //! `/brush` / `/br` - bind WorldEdit-style brushes to the held item.
 //!
-//! This implements the brush command surface that can be backed by Pumpkin's
-//! current block APIs: shape brushes, clipboard stamping, simple terrain
-//! smoothing, gravity, extinguish, raise/lower, splatter, and morph presets.
-//! Commands that need entities, biomes, features, images, or FAWE's expression
-//! engine are accepted as known brush names and report a precise unsupported
-//! message instead of silently doing the wrong thing.
+//! This implements the FAWE-inspired brush surface that can be backed by
+//! Pumpkin's current block APIs: shape brushes (including FAWE's falling
+//! sphere and hollow cylinder thickness), clipboard stamping, populate
+//! schematic scattering, simple terrain smoothing, gravity, extinguish,
+//! raise/lower, splatter, layered snow, and the erode/pull/dilate/morph
+//! preset family. Parity tracks the local `FastAsyncWorldEdit`
+//! `BrushCommands` / `ToolUtilCommands` command names and defaults where that
+//! maps cleanly onto Pumpkin's block-only world model. Commands that need
+//! entities, biomes, features, image loading, or FAWE's richer tool state are
+//! accepted as known brush names and report a precise unsupported message
+//! instead of silently doing the wrong thing.
+//!
+//! Known intentional deviations from FAWE, where Pumpkin's block-only API or
+//! determinism for undo/tests made an exact match impractical:
+//! - Erode/pull/dilate map onto the 6-neighbor morph pass instead of FAWE's
+//!   4-face cardinal erosion, and erosion carves to air rather than the most
+//!   common neighboring fluid.
+//! - Gravity compacts columns fully (upstream WorldEdit behavior) instead of
+//!   reproducing FAWE's gap-preserving `freeSpot = y + 1` quirk.
+//! - Populate schematic, splatter, and clipboard random rotation use
+//!   position-hash randomness instead of `ThreadLocalRandom`, so repeated
+//!   clicks on the same target are reproducible.
+//! - Sphere brushes do not auto-switch sand/gravel patterns to falling mode;
+//!   use `-f` explicitly.
+//! - Pull reuses the `worldedit.brush.morph` permission node instead of
+//!   FAWE's `worldedit.brush.pull`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,6 +48,7 @@ use crate::{
     history::{self, EditEntry},
     mapping,
     pattern::{BlockMask, BlockPattern, PatternEvalContext},
+    schematic,
     transform::Transform,
 };
 
@@ -38,14 +59,28 @@ use super::{
 const MAX_RADIUS: f64 = 64.0;
 const MAX_HEIGHT: i32 = 256;
 const DEFAULT_RADIUS: f64 = 5.0;
+/// FAWE's sphere/cylinder brushes default to radius 2, not the generic 5.
+const SHAPE_DEFAULT_RADIUS: f64 = 2.0;
+/// FAWE's smooth brush samples a radius of 2 by default.
+const SMOOTH_DEFAULT_RADIUS: i32 = 2;
 const DEFAULT_HEIGHT: i32 = 1;
 const DEFAULT_RANGE: f64 = 200.0;
 const MIN_BUILD_Y: i32 = -64;
 const MAX_BUILD_Y: i32 = 319;
+/// Maximum vanilla snow layer count before a column becomes a full snow block.
+const MAX_SNOW_LAYERS: i32 = 8;
 
 const BRUSH_COMMAND_PERMISSION: &str = "worldedit-rs:command.brush";
+const BRUSH_USAGE: &str = concat!(
+    "Usage: //brush <brush|setting> ...\n",
+    "Supported brushes: sphere [-h|-f], cylinder [-h] (with thickness), set, clipboard [-a|-o|-r], smooth, gravity [-h], extinguish, splatter, raise, lower, erode, pull, dilate, morph, snow [-s], blendball, surface, overlay, scatter, height, heightmap, flatten, cliff, populateschematic [-r].\n",
+    "Stored phase-one stubs: scattercommand, spline, surfacespline/sspl, sweep, catenary, shatter, command.\n",
+    "Settings: size, material/mat, mask, range, tracemask/tm, targetmask/tarmask, target/tar, vis, scroll.\n",
+    "Notes: FAWE aliases audited from the local FastAsyncWorldEdit source; copy-on-click brushes, image/stencil brushes, and entity/biome/generation brushes still report explicit unsupported errors."
+);
 
 pub fn register(context: &Context) {
+    DATA_FOLDER.with_borrow_mut(|folder| *folder = context.get_data_folder());
     let args = CommandNode::argument("args", &ArgumentType::String(StringType::Greedy))
         .execute(BrushCommand);
     let command = Command::new(
@@ -75,6 +110,7 @@ pub fn register(context: &Context) {
         ("target", "target"),
         ("tar", "target"),
         ("vis", "vis"),
+        ("visualize", "vis"),
         ("scroll", "scroll"),
         ("sphere", "sphere"),
         ("s", "sphere"),
@@ -94,6 +130,7 @@ pub fn register(context: &Context) {
         ("raise", "raise"),
         ("lower", "lower"),
         ("erode", "erode"),
+        ("pull", "pull"),
         ("dilate", "dilate"),
         ("morph", "morph"),
         ("snow", "snow"),
@@ -121,6 +158,8 @@ pub fn register(context: &Context) {
         ("flatten", "flatten"),
         ("flat", "flatten"),
         ("flatmap", "flatten"),
+        ("cliff", "flatten"),
+        ("flatcylinder", "flatten"),
         ("height", "height"),
         ("surfaceoverlay", "overlay"),
         ("overlay", "overlay"),
@@ -362,6 +401,9 @@ struct PlayerBrushes {
 
 thread_local! {
     static BRUSHES: RefCell<HashMap<String, PlayerBrushes>> = RefCell::new(HashMap::new());
+    /// Plugin data folder, captured at registration so the populate schematic
+    /// brush can load `.schem` files from `<data folder>/schematics/`.
+    static DATA_FOLDER: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -551,12 +593,14 @@ enum BrushKind {
         pattern: BlockPattern,
         radius: f64,
         hollow: bool,
+        falling: bool,
     },
     Cylinder {
         pattern: BlockPattern,
         radius: f64,
         height: i32,
         hollow: bool,
+        thickness: f64,
     },
     Cuboid {
         pattern: BlockPattern,
@@ -574,7 +618,7 @@ enum BrushKind {
     },
     Gravity {
         radius: i32,
-        height: i32,
+        full_height: bool,
     },
     Extinguish {
         radius: i32,
@@ -723,9 +767,11 @@ impl BrushKind {
                 pattern,
                 radius,
                 hollow,
+                falling,
             } => format!(
-                "{}sphere brush, radius {radius:.1}, pattern {}",
+                "{}{}sphere brush, radius {radius:.1}, pattern {}",
                 if *hollow { "hollow " } else { "" },
+                if *falling { "falling " } else { "" },
                 pattern.description()
             ),
             Self::Cylinder {
@@ -733,9 +779,15 @@ impl BrushKind {
                 radius,
                 height,
                 hollow,
+                thickness,
             } => format!(
-                "{}cylinder brush, radius {radius:.1}, height {height}, pattern {}",
+                "{}cylinder brush, radius {radius:.1}, height {height}{}, pattern {}",
                 if *hollow { "hollow " } else { "" },
+                if *hollow && *thickness > 0.0 {
+                    format!(", thickness {thickness:.1}")
+                } else {
+                    String::new()
+                },
                 pattern.description()
             ),
             Self::Cuboid { pattern, radius } => {
@@ -767,9 +819,17 @@ impl BrushKind {
             } => {
                 format!("smooth brush, radius {radius}, {iterations} iterations")
             }
-            Self::Gravity { radius, height } => {
-                format!("gravity brush, radius {radius}, height {height}")
-            }
+            Self::Gravity {
+                radius,
+                full_height,
+            } => format!(
+                "gravity brush, radius {radius}{}",
+                if *full_height {
+                    ", from world bottom"
+                } else {
+                    ""
+                }
+            ),
             Self::Extinguish { radius } => format!("extinguish brush, radius {radius}"),
             Self::Splatter {
                 pattern,
@@ -1130,7 +1190,7 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
         "tracemask" | "tm" => parse_mask_setting(args, BrushSettingKind::TraceMask),
         "targetmask" | "tarmask" => parse_mask_setting(args, BrushSettingKind::TargetMask),
         "target" | "tar" => parse_target(args),
-        "vis" => parse_vis(args),
+        "vis" | "visualize" => parse_vis(args),
         "scroll" => parse_scroll(args),
         "sphere" | "s" => parse_sphere(args),
         "cylinder" | "cyl" | "c" => parse_cylinder(args),
@@ -1142,8 +1202,12 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
         "splatter" | "splat" => parse_splatter(args),
         "raise" => parse_raise_lower(args, false),
         "lower" => parse_raise_lower(args, true),
-        "erode" => parse_morph_preset(args, 3, 1, 5, 1),
-        "dilate" => parse_morph_preset(args, 5, 0, 3, 1),
+        // FAWE presets: erode = ErodeBrush(2, 1, 5, 1), pull = RaiseBrush(6, 0, 1, 1),
+        // dilate = MorphBrush(5, 1, 2, 1). Erode and pull also accept the four
+        // optional face/iteration arguments like FAWE's /br erode.
+        "erode" => parse_erode_style(args, 2, 1, 5, 1),
+        "pull" => parse_erode_style(args, 6, 0, 1, 1),
+        "dilate" => parse_morph_preset(args, 5, 1, 2, 1),
         "morph" => parse_morph(args),
         "snow" => parse_snow(args),
         "blendball" | "bb" | "blend" => parse_blendball(args),
@@ -1160,10 +1224,24 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
         "populateschematic" | "populateschem" | "popschem" | "pschem" | "ps" => {
             parse_populate_schematic(args)
         }
-        "flatten" | "flat" | "flatmap" => parse_terrain_kind(args, TerrainKind::Flatten),
+        "flatten" | "flat" | "flatmap" | "cliff" | "flatcylinder" => {
+            parse_terrain_kind(args, TerrainKind::Flatten)
+        }
         "height" => parse_terrain_kind(args, TerrainKind::Height),
         "heightmap" => parse_terrain_kind(args, TerrainKind::Heightmap),
-        "forest" | "butcher" | "kill" | "paint" | "snowsmooth" | "feature" | "apply" | "deform"
+        "copypaste" | "cp" | "copypasta" => Ok(ParsedBrushCommand::Unsupported {
+            name,
+            reason: "the local FastAsyncWorldEdit copy-on-left-click brush semantics are not implemented here; use `clipboard` for the current paste-only brush path.",
+        }),
+        "stencil" | "image" => Ok(ParsedBrushCommand::Unsupported {
+            name,
+            reason: "it depends on image-backed heightmaps that this plugin does not load yet.",
+        }),
+        "snowsmooth" => Ok(ParsedBrushCommand::Unsupported {
+            name,
+            reason: "snow-layer-aware heightmap smoothing is not implemented yet; use //brush smooth or //brush snow instead.",
+        }),
+        "forest" | "butcher" | "kill" | "paint" | "feature" | "apply" | "deform"
         | "biome" => Ok(ParsedBrushCommand::Unsupported {
             name,
             reason: "it needs entities, biomes, generation features, images, or FAWE expressions that this plugin cannot access yet.",
@@ -1265,26 +1343,48 @@ fn parse_scroll(args: &[String]) -> Result<ParsedBrushCommand, String> {
 }
 
 fn parse_sphere(args: &[String]) -> Result<ParsedBrushCommand, String> {
-    let (hollow, rest) = consume_hollow(args);
-    let pattern = parse_required_pattern(rest.first())?;
-    let radius = parse_optional_radius(rest.get(1), DEFAULT_RADIUS)?;
+    let (flags, positional) = split_flags(args, &['h', 'f'], "sphere")?;
+    let hollow = flags.contains(&'h');
+    let falling = flags.contains(&'f');
+    if hollow && falling {
+        return Err("Sphere brush flags '-h' and '-f' cannot be combined.".to_string());
+    }
+    let pattern = parse_required_pattern_str(positional.first().copied())?;
+    let radius = parse_optional_radius_str(positional.get(1).copied(), SHAPE_DEFAULT_RADIUS)?;
+    if let Some(unexpected) = positional.get(2) {
+        return Err(format!("Unexpected sphere brush argument '{unexpected}'."));
+    }
     Ok(bind(BrushKind::Sphere {
         pattern,
         radius,
         hollow,
+        falling,
     }))
 }
 
 fn parse_cylinder(args: &[String]) -> Result<ParsedBrushCommand, String> {
-    let (hollow, rest) = consume_hollow(args);
-    let pattern = parse_required_pattern(rest.first())?;
-    let radius = parse_optional_radius(rest.get(1), DEFAULT_RADIUS)?;
-    let height = parse_optional_i32(rest.get(2), DEFAULT_HEIGHT)?.clamp(1, MAX_HEIGHT);
+    let (flags, positional) = split_flags(args, &['h'], "cylinder")?;
+    let hollow = flags.contains(&'h');
+    let pattern = parse_required_pattern_str(positional.first().copied())?;
+    let radius = parse_optional_radius_str(positional.get(1).copied(), SHAPE_DEFAULT_RADIUS)?;
+    let height = parse_optional_i32_str(positional.get(2).copied(), DEFAULT_HEIGHT)?
+        .clamp(1, MAX_HEIGHT);
+    let thickness = parse_optional_f64_str(positional.get(3).copied(), 0.0)?;
+    if !thickness.is_finite() || thickness < 0.0 || thickness >= radius {
+        return Err("Cylinder thickness must be zero or positive and smaller than the radius.".to_string());
+    }
+    if thickness > 0.0 && !hollow {
+        return Err("Cylinder thickness requires the '-h' hollow flag.".to_string());
+    }
+    if let Some(unexpected) = positional.get(4) {
+        return Err(format!("Unexpected cylinder brush argument '{unexpected}'."));
+    }
     Ok(bind(BrushKind::Cylinder {
         pattern,
         radius,
         height,
         hollow,
+        thickness,
     }))
 }
 
@@ -1303,12 +1403,14 @@ fn parse_set(args: &[String]) -> Result<ParsedBrushCommand, String> {
             pattern,
             radius: clamp_radius(radius as f64)?,
             hollow: false,
+            falling: false,
         })),
         Shape::Cylinder => Ok(bind(BrushKind::Cylinder {
             pattern,
             radius: clamp_radius(radius as f64)?,
             height: DEFAULT_HEIGHT,
             hollow: false,
+            thickness: 0.0,
         })),
         Shape::Cuboid => Ok(bind(BrushKind::Cuboid {
             pattern,
@@ -1347,7 +1449,7 @@ fn parse_clipboard(args: &[String]) -> Result<ParsedBrushCommand, String> {
 }
 
 fn parse_smooth(args: &[String]) -> Result<ParsedBrushCommand, String> {
-    let radius = parse_optional_i32(args.first(), DEFAULT_RADIUS as i32)?;
+    let radius = parse_optional_i32(args.first(), SMOOTH_DEFAULT_RADIUS)?;
     let iterations = parse_optional_i32(args.get(1), 4)?.clamp(1, 20) as u32;
     let height_mask = match args.get(2) {
         Some(mask) => Some(BlockMask::parse(mask)?),
@@ -1361,21 +1463,15 @@ fn parse_smooth(args: &[String]) -> Result<ParsedBrushCommand, String> {
 }
 
 fn parse_gravity(args: &[String]) -> Result<ParsedBrushCommand, String> {
-    let radius = parse_optional_i32(args.first(), DEFAULT_RADIUS as i32)?;
-    let mut height = MAX_HEIGHT;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-h" => {
-                height = parse_i32(args.get(i + 1), "height")?.clamp(1, MAX_HEIGHT);
-                i += 2;
-            }
-            other => return Err(format!("Unexpected gravity brush argument '{other}'.")),
-        }
+    let (flags, positional) = split_flags(args, &['h'], "gravity")?;
+    let full_height = flags.contains(&'h');
+    let radius = parse_optional_i32_str(positional.first().copied(), DEFAULT_RADIUS as i32)?;
+    if let Some(unexpected) = positional.get(1) {
+        return Err(format!("Unexpected gravity brush argument '{unexpected}'."));
     }
     Ok(bind(BrushKind::Gravity {
         radius: clamp_radius(radius as f64)? as i32,
-        height,
+        full_height,
     }))
 }
 
@@ -1426,6 +1522,38 @@ fn parse_morph_preset(
     dilate_iterations: u32,
 ) -> Result<ParsedBrushCommand, String> {
     let radius = parse_optional_i32(args.first(), DEFAULT_RADIUS as i32)?;
+    if let Some(unexpected) = args.get(1) {
+        return Err(format!("Unexpected brush argument '{unexpected}'."));
+    }
+    Ok(bind(BrushKind::Morph {
+        radius: clamp_radius(radius as f64)? as i32,
+        min_erode_faces,
+        erode_iterations,
+        min_dilate_faces,
+        dilate_iterations,
+    }))
+}
+
+/// FAWE's `/br erode` and `/br pull` take `[radius] [erodeFaces] [erodeRec]
+/// [fillFaces] [fillRec]`, defaulting to the given preset. The fill pass maps
+/// onto the morph brush's dilate pass.
+fn parse_erode_style(
+    args: &[String],
+    erode_faces: u8,
+    erode_recursion: u32,
+    fill_faces: u8,
+    fill_recursion: u32,
+) -> Result<ParsedBrushCommand, String> {
+    let radius = parse_optional_i32(args.first(), DEFAULT_RADIUS as i32)?;
+    let min_erode_faces = parse_optional_i32(args.get(1), erode_faces as i32)?.clamp(0, 6) as u8;
+    let erode_iterations =
+        parse_optional_i32(args.get(2), erode_recursion as i32)?.clamp(0, 20) as u32;
+    let min_dilate_faces = parse_optional_i32(args.get(3), fill_faces as i32)?.clamp(0, 6) as u8;
+    let dilate_iterations =
+        parse_optional_i32(args.get(4), fill_recursion as i32)?.clamp(0, 20) as u32;
+    if let Some(unexpected) = args.get(5) {
+        return Err(format!("Unexpected brush argument '{unexpected}'."));
+    }
     Ok(bind(BrushKind::Morph {
         radius: clamp_radius(radius as f64)? as i32,
         min_erode_faces,
@@ -1451,18 +1579,16 @@ fn parse_morph(args: &[String]) -> Result<ParsedBrushCommand, String> {
 }
 
 fn parse_snow(args: &[String]) -> Result<ParsedBrushCommand, String> {
-    let mut stack = false;
-    let rest = if args.first().is_some_and(|s| s == "-s") {
-        stack = true;
-        &args[1..]
-    } else {
-        args
-    };
-    let shape = rest
+    let (flags, positional) = split_flags(args, &['s'], "snow")?;
+    let stack = flags.contains(&'s');
+    let shape = positional
         .first()
         .and_then(|s| Shape::parse(s))
         .ok_or_else(|| "Usage: //brush snow [-s] <sphere|cylinder|cuboid> [radius]".to_string())?;
-    let radius = parse_optional_i32(rest.get(1), DEFAULT_RADIUS as i32)?;
+    let radius = parse_optional_i32_str(positional.get(1).copied(), DEFAULT_RADIUS as i32)?;
+    if let Some(unexpected) = positional.get(2) {
+        return Err(format!("Unexpected snow brush argument '{unexpected}'."));
+    }
     Ok(bind(BrushKind::Snow {
         shape,
         radius: clamp_radius(radius as f64)? as i32,
@@ -1859,15 +1985,43 @@ fn bind(kind: BrushKind) -> ParsedBrushCommand {
     ParsedBrushCommand::Bind(BrushBinding::with_kind(kind, None))
 }
 
-fn consume_hollow(args: &[String]) -> (bool, &[String]) {
-    if args.first().is_some_and(|s| s == "-h") {
-        (true, &args[1..])
-    } else {
-        (false, args)
+/// Split FAWE-style switches (`-h`, `-hf`) out of an argument list, accepting
+/// them in any position like FAWE's command parser. Returns the flags seen and
+/// the remaining positional arguments. Numeric-looking tokens such as `-0.5`
+/// are kept positional.
+fn split_flags<'a>(
+    args: &'a [String],
+    allowed: &[char],
+    brush_name: &str,
+) -> Result<(Vec<char>, Vec<&'a str>), String> {
+    let mut flags = Vec::new();
+    let mut positional = Vec::new();
+    for arg in args {
+        let Some(chars) = arg.strip_prefix('-') else {
+            positional.push(arg.as_str());
+            continue;
+        };
+        if chars.is_empty() || arg.parse::<f64>().is_ok() {
+            positional.push(arg.as_str());
+            continue;
+        }
+        for flag in chars.chars() {
+            if !allowed.contains(&flag) {
+                return Err(format!("Unknown {brush_name} brush flag '-{flag}'."));
+            }
+            if !flags.contains(&flag) {
+                flags.push(flag);
+            }
+        }
     }
+    Ok((flags, positional))
 }
 
 fn parse_required_pattern(raw: Option<&String>) -> Result<BlockPattern, String> {
+    parse_required_pattern_str(raw.map(String::as_str))
+}
+
+fn parse_required_pattern_str(raw: Option<&str>) -> Result<BlockPattern, String> {
     let Some(raw) = raw else {
         return Err("Expected a block pattern.".to_string());
     };
@@ -1981,9 +2135,7 @@ fn held_item_key(player: &Player) -> Option<ToolBindingKey> {
 }
 
 fn send_brush_usage(sender: &CommandSender) {
-    sender.send_error(TextComponent::text(
-        "Usage: //brush <sphere|cylinder|set|clipboard|smooth|gravity|extinguish|splatter|raise|lower|erode|dilate|morph|snow|blendball|surface|overlay|scatter|scattercommand|height|flatten|spline|surfacespline|sweep|catenary|shatter|command|populateschematic|none|list|size|material|mask|range|tracemask|targetmask|target|vis|scroll> ...",
-    ));
+    sender.send_error(TextComponent::text(BRUSH_USAGE));
 }
 
 struct BrushInteractHandler;
@@ -2093,12 +2245,18 @@ fn apply_brush(
             pattern,
             radius,
             hollow,
+            falling,
         } => {
             pattern.validate(&pattern_ctx)?;
+            let positions = if *falling {
+                falling_sphere_positions(world, target, *radius)
+            } else {
+                sphere_positions(target, *radius, *hollow)
+            };
             Ok(apply_pattern_positions(
                 key,
                 world,
-                sphere_positions(target, *radius, *hollow),
+                positions,
                 pattern,
                 &pattern_ctx,
                 binding.mask.as_ref(),
@@ -2109,12 +2267,13 @@ fn apply_brush(
             radius,
             height,
             hollow,
+            thickness,
         } => {
             pattern.validate(&pattern_ctx)?;
             Ok(apply_pattern_positions(
                 key,
                 world,
-                cylinder_positions(target, *radius, *height, *hollow),
+                cylinder_positions(target, *radius, *height, *hollow, *thickness),
                 pattern,
                 &pattern_ctx,
                 binding.mask.as_ref(),
@@ -2157,12 +2316,15 @@ fn apply_brush(
             height_mask.as_ref(),
             binding.mask.as_ref(),
         )),
-        BrushKind::Gravity { radius, height } => Ok(apply_gravity(
+        BrushKind::Gravity {
+            radius,
+            full_height,
+        } => Ok(apply_gravity(
             key,
             world,
             target,
             *radius,
-            *height,
+            *full_height,
             binding.mask.as_ref(),
         )),
         BrushKind::Extinguish { radius } => Ok(apply_extinguish(
@@ -2293,9 +2455,22 @@ fn apply_brush(
             "Command brushes are parsed and stored, but command execution brushes are not enabled yet."
                 .to_string(),
         ),
-        BrushKind::PopulateSchematic { .. } => Err(
-            "Populate schematic brushes are parsed and stored, but scatter schematic placement is not implemented yet."
-                .to_string(),
+        BrushKind::PopulateSchematic {
+            clipboard,
+            placement_mask,
+            radius,
+            density,
+            rotate,
+        } => apply_populate_schematic(
+            key,
+            world,
+            target,
+            clipboard,
+            placement_mask.as_ref(),
+            *radius,
+            *density,
+            *rotate,
+            binding.mask.as_ref(),
         ),
     }
 }
@@ -2537,38 +2712,66 @@ fn apply_smooth(
     commit_entry(key, world, entry)
 }
 
+/// FAWE's `GravityBrush`: every non-air block in a square column footprint of
+/// `radius` falls to the lowest free spot. With `-h` (`full_height`) the scan
+/// starts at the world bottom instead of `target.y - radius`, matching FAWE's
+/// `fullHeight` switch. Blocks failing the brush mask stay in place and act as
+/// floors for blocks above them.
 fn apply_gravity(
     key: &str,
     world: &World,
     target: BlockPos,
     radius: i32,
-    height: i32,
+    full_height: bool,
     mask: Option<&BlockMask>,
 ) -> usize {
-    let min_y = (target.y - height / 2).max(MIN_BUILD_Y);
-    let max_y = (target.y + height / 2).min(MAX_BUILD_Y);
+    let min_y = if full_height {
+        MIN_BUILD_Y
+    } else {
+        (target.y - radius).max(MIN_BUILD_Y)
+    };
+    let max_y = (target.y + radius).min(MAX_BUILD_Y);
     let mut entry = EditEntry::default();
     for dz in -radius..=radius {
         for dx in -radius..=radius {
-            if dx * dx + dz * dz > radius * radius {
-                continue;
-            }
             let x = target.x + dx;
             let z = target.z + dz;
-            let mut solids = Vec::new();
-            for y in min_y..=max_y {
-                let state = world.get_block_state_id(BlockPos { x, y, z });
-                if state != 0 && mask.is_none_or(|mask| mask.matches(state)) {
-                    solids.push(state);
-                }
-            }
+            let before: Vec<u16> = (min_y..=max_y)
+                .map(|y| world.get_block_state_id(BlockPos { x, y, z }))
+                .collect();
+            let after = compact_column_states(&before, |state| {
+                mask.is_none_or(|mask| mask.matches(state))
+            });
             for (i, y) in (min_y..=max_y).enumerate() {
-                let after = solids.get(i).copied().unwrap_or(0);
-                push_change(key, world, &mut entry, BlockPos { x, y, z }, after, None);
+                push_change(key, world, &mut entry, BlockPos { x, y, z }, after[i], None);
             }
         }
     }
     commit_entry(key, world, entry)
+}
+
+/// Drop movable non-air blocks to the lowest free spot in a column, bottom to
+/// top, like FAWE's gravity loop. Blocks where `movable` returns false keep
+/// their position and become the new floor for anything above.
+fn compact_column_states(states: &[u16], movable: impl Fn(u16) -> bool) -> Vec<u16> {
+    let mut after = states.to_vec();
+    let mut free_spot = 0usize;
+    for i in 0..after.len() {
+        let state = after[i];
+        if state == 0 {
+            continue;
+        }
+        if !movable(state) {
+            free_spot = i + 1;
+            continue;
+        }
+        if i != free_spot {
+            after[i] = 0;
+            after[free_spot] = state;
+        }
+        free_spot += 1;
+    }
+    after
 }
 
 fn apply_extinguish(
@@ -2693,6 +2896,11 @@ fn apply_morph(
     commit_entry(key, world, entry)
 }
 
+/// Mirrors WorldEdit's `SnowSimulator` for the block-only subset: one snow
+/// layer goes on top of the surface, `-s` stacking raises an existing layer
+/// stack by one (layers 1..=7 increment, the 8th converts the stack into a
+/// full snow block), and blocks that support a `snowy` state property (grass,
+/// podzol, mycelium) are switched to their snowy look beneath new snow.
 fn apply_snow(
     key: &str,
     world: &World,
@@ -2705,6 +2913,7 @@ fn apply_snow(
     let Some(snow) = mapping::resolve_block("snow") else {
         return 0;
     };
+    let snow_block = mapping::resolve_block("snow_block");
     let mut entry = EditEntry::default();
     for hit in surface_hits_for_shape(
         world,
@@ -2722,16 +2931,87 @@ fn apply_snow(
         if mask.is_some_and(|mask| !mask.matches(top_state)) {
             continue;
         }
-        let y = if stack && top_state == snow {
-            top_y
-        } else {
-            top_y + 1
-        };
-        if y <= MAX_BUILD_Y {
-            push_change(key, world, &mut entry, BlockPos { x, y, z }, snow, None);
+        let layers = snow_layer_count(top_state);
+        if let Some(layers) = layers
+            && layers < MAX_SNOW_LAYERS
+        {
+            if !stack {
+                // A partial layer stack cannot support another layer; FAWE's
+                // simulator only adds to it in stack mode.
+                continue;
+            }
+            let after = if layers == MAX_SNOW_LAYERS - 1 {
+                snow_block
+            } else {
+                snow_state_with_layers(layers + 1)
+            };
+            if let Some(after) = after {
+                push_change(
+                    key,
+                    world,
+                    &mut entry,
+                    BlockPos { x, y: top_y, z },
+                    after,
+                    None,
+                );
+            }
+            continue;
+        }
+        if top_y + 1 > MAX_BUILD_Y {
+            continue;
+        }
+        push_change(
+            key,
+            world,
+            &mut entry,
+            BlockPos {
+                x,
+                y: top_y + 1,
+                z,
+            },
+            snow,
+            None,
+        );
+        // Switch grass-likes under the new layer to their snowy variant.
+        // `apply_state_properties` returns the input state unchanged when the
+        // block has no `snowy` property, making this a no-op for other blocks.
+        if let Some(snowy) = mapping::apply_state_properties(top_state, "snowy=true")
+            && snowy != top_state
+        {
+            push_change(
+                key,
+                world,
+                &mut entry,
+                BlockPos { x, y: top_y, z },
+                snowy,
+                None,
+            );
         }
     }
     commit_entry(key, world, entry)
+}
+
+/// If `state` is a snow layer block, return its current `layers` count.
+fn snow_layer_count(state: u16) -> Option<i32> {
+    let key = mapping::palette_key_for_state_id(state);
+    let (name, rest) = key.split_once('[').map_or((key.as_str(), None), |(n, r)| (n, Some(r)));
+    if name != "minecraft:snow" {
+        return None;
+    }
+    let layers = rest
+        .and_then(|props| {
+            props
+                .trim_end_matches(']')
+                .split(',')
+                .find_map(|prop| prop.strip_prefix("layers="))
+                .and_then(|value| value.parse::<i32>().ok())
+        })
+        .unwrap_or(1);
+    Some(layers)
+}
+
+fn snow_state_with_layers(layers: i32) -> Option<u16> {
+    mapping::state_id_for(&format!("minecraft:snow[layers={layers}]"))
 }
 
 #[derive(Clone, Copy)]
@@ -2818,6 +3098,126 @@ fn apply_terrain_brush(
     commit_entry(key, world, entry)
 }
 
+/// FAWE's populate schematic brush (`Extent#addSchems` + `SchemGen`): every
+/// chunk overlapping the brush cuboid gets a `density`% chance of one
+/// placement attempt at a pseudo-random column, pasting the clipboard
+/// (skipping air) with its origin anchored one block above the highest
+/// surface block matching `placement_mask`. Randomness is derived from the
+/// target and chunk positions so repeated clicks on the same spot reproduce
+/// the same scatter, keeping undo and tests predictable.
+#[allow(clippy::too_many_arguments)]
+fn apply_populate_schematic(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    source: &str,
+    placement_mask: Option<&BlockMask>,
+    radius: f64,
+    density: i32,
+    rotate: bool,
+    mask: Option<&BlockMask>,
+) -> Result<usize, String> {
+    let buffer = load_populate_clipboard(key, source)?;
+    let r = radius.ceil() as i32;
+    let min_x = target.x - r;
+    let max_x = target.x + r;
+    let min_z = target.z - r;
+    let max_z = target.z + r;
+    let min_y = (target.y - r).max(MIN_BUILD_Y);
+    let max_y = (target.y + r).min(MAX_BUILD_Y);
+
+    let mut entry = EditEntry::default();
+    for chunk_z in (min_z >> 4)..=(max_z >> 4) {
+        for chunk_x in (min_x >> 4)..=(max_x >> 4) {
+            let Some((x, z)) = populate_chunk_attempt(target, chunk_x, chunk_z, density) else {
+                continue;
+            };
+            if x < min_x || x > max_x || z < min_z || z > max_z {
+                continue;
+            }
+            let Some((surface_y, _)) =
+                top_solid_in_column(world, x, z, min_y, max_y, placement_mask)
+            else {
+                continue;
+            };
+            let paste_at = BlockPos {
+                x,
+                y: surface_y + 1,
+                z,
+            };
+            let stamped = if rotate {
+                buffer.transformed(deterministic_clipboard_rotation(paste_at))
+            } else {
+                buffer.clone()
+            };
+            for &((dx, dy, dz), state) in &stamped.blocks {
+                if state == 0 {
+                    continue;
+                }
+                let pos = BlockPos {
+                    x: paste_at.x + dx,
+                    y: paste_at.y + dy,
+                    z: paste_at.z + dz,
+                };
+                if pos.y < MIN_BUILD_Y || pos.y > MAX_BUILD_Y {
+                    continue;
+                }
+                push_change(key, world, &mut entry, pos, state, mask);
+            }
+        }
+    }
+    Ok(commit_entry(key, world, entry))
+}
+
+/// One deterministic placement attempt per chunk: returns the column to try,
+/// or `None` when the `density`% roll fails. Mirrors `Extent#spawnResource`,
+/// which rolls once per chunk and picks a random offset inside it.
+fn populate_chunk_attempt(
+    target: BlockPos,
+    chunk_x: i32,
+    chunk_z: i32,
+    density: i32,
+) -> Option<(i32, i32)> {
+    let seed = position_hash(BlockPos {
+        x: chunk_x,
+        y: target.y,
+        z: chunk_z,
+    }) ^ position_hash(target).rotate_left(7);
+    if (seed % 100) as i32 >= density.min(100) {
+        return None;
+    }
+    let x = (chunk_x << 4) + ((seed >> 8) % 16) as i32;
+    let z = (chunk_z << 4) + ((seed >> 16) % 16) as i32;
+    Some((x, z))
+}
+
+/// Resolve the populate schematic source: `#clipboard` (or `#copy`) uses the
+/// player's current clipboard including its pending transform; anything else
+/// loads `<data folder>/schematics/<name>.schem` like `//schematic load`.
+fn load_populate_clipboard(
+    key: &str,
+    source: &str,
+) -> Result<clipboard::ClipboardBuffer, String> {
+    if source.eq_ignore_ascii_case("#clipboard") || source.eq_ignore_ascii_case("#copy") {
+        let (buffer, transform) = clipboard::get_with_transform(key)
+            .ok_or_else(|| "Your clipboard is empty. Use //copy first.".to_string())?;
+        return Ok(buffer.transformed(transform));
+    }
+    if source.trim().is_empty() || source.contains(['/', '\\']) || source.contains("..") {
+        return Err(format!("Invalid schematic name '{source}'."));
+    }
+    let mut path = DATA_FOLDER
+        .with_borrow(|folder| std::path::Path::new(folder).join("schematics").join(source));
+    if path.extension().and_then(|e| e.to_str()) != Some("schem") {
+        path.set_extension("schem");
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|_| format!("Schematic '{source}' was not found in the schematics folder."))?;
+    let parsed = schematic::parse(&bytes)
+        .map_err(|e| format!("Failed to parse schematic '{source}': {e}"))?;
+    Ok(clipboard::from_schematic(&parsed))
+}
+
 fn push_change(
     key: &str,
     world: &World,
@@ -2869,24 +3269,64 @@ fn sphere_positions(center: BlockPos, radius: f64, hollow: bool) -> Vec<BlockPos
     positions
 }
 
-fn cylinder_positions(center: BlockPos, radius: f64, height: i32, hollow: bool) -> Vec<BlockPos> {
+/// Cylinder block positions. Hollow cylinders are open-ended tubes like
+/// FAWE's `HollowCylinderBrush` (no top/bottom caps); `thickness` widens the
+/// wall inward, with `0.0` giving the standard one-block shell.
+fn cylinder_positions(
+    center: BlockPos,
+    radius: f64,
+    height: i32,
+    hollow: bool,
+    thickness: f64,
+) -> Vec<BlockPos> {
     let r = radius.ceil() as i32;
     let radius2 = radius * radius;
-    let inner2 = (radius - 1.0).max(0.0).powi(2);
+    let inner2 = (radius - 1.0 - thickness).max(0.0).powi(2);
     let mut positions = Vec::new();
     for y in center.y..center.y.saturating_add(height).min(MAX_BUILD_Y + 1) {
         for dz in -r..=r {
             for dx in -r..=r {
                 let d2 = (dx * dx + dz * dz) as f64;
-                if d2 <= radius2
-                    && (!hollow || d2 > inner2 || y == center.y || y == center.y + height - 1)
-                {
+                if d2 <= radius2 && (!hollow || d2 > inner2) {
                     positions.push(BlockPos {
                         x: center.x + dx,
                         y,
                         z: center.z + dz,
                     });
                 }
+            }
+        }
+    }
+    positions
+}
+
+/// FAWE's `FallingSphere`: each column of the sphere settles onto the highest
+/// terrain block beneath it, so unsupported parts of the sphere drop until
+/// they rest on the surface instead of floating.
+fn falling_sphere_positions(world: &World, center: BlockPos, radius: f64) -> Vec<BlockPos> {
+    let r = radius.ceil() as i32;
+    let radius2 = radius * radius;
+    let mut positions = Vec::new();
+    for dz in -r..=r {
+        for dx in -r..=r {
+            let remaining = radius2 - f64::from(dx * dx + dz * dz);
+            if remaining < 0.0 {
+                continue;
+            }
+            let y_radius = remaining.sqrt().floor() as i32;
+            let x = center.x + dx;
+            let z = center.z + dz;
+            let mut start_y = (center.y - y_radius).max(MIN_BUILD_Y);
+            let mut end_y = (center.y + y_radius).min(MAX_BUILD_Y);
+            let surface_y = top_solid_in_column(world, x, z, MIN_BUILD_Y, end_y, None)
+                .map_or(MIN_BUILD_Y, |(y, _)| y);
+            if surface_y < start_y {
+                let drop = start_y - surface_y;
+                start_y -= drop;
+                end_y -= drop;
+            }
+            for y in start_y.max(MIN_BUILD_Y)..=end_y {
+                positions.push(BlockPos { x, y, z });
             }
         }
     }
@@ -3006,7 +3446,6 @@ fn surface_hits_for_shape(
     })
 }
 
-#[allow(dead_code)]
 fn top_solid_in_column(
     world: &World,
     x: i32,
@@ -3464,6 +3903,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_fawe_cliff_alias_as_flatten() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("cliff 7 mymap 90 1.5").expect("valid cliff alias")
+        else {
+            panic!("expected flatten bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Flatten {
+                settings: TerrainBrushSettings {
+                    radius,
+                    y_scale: 1.5,
+                    rotation: 90,
+                    image: Some(ref image),
+                    ..
+                },
+            } if (radius - 7.0).abs() < f64::EPSILON && image == "mymap"
+        ));
+    }
+
+    #[test]
+    fn recognizes_fawe_copypaste_as_unsupported() {
+        let ParsedBrushCommand::Unsupported { name, reason } =
+            parse_brush_command("copypaste 5").expect("known unsupported brush")
+        else {
+            panic!("expected unsupported brush");
+        };
+        assert_eq!(name, "copypaste");
+        assert!(reason.contains("copy-on-left-click"));
+    }
+
+    #[test]
     fn collects_surface_hits_with_masked_sampling() {
         let stone = mapping::resolve_block("stone").expect("stone");
         let dirt = mapping::resolve_block("dirt").expect("dirt");
@@ -3736,6 +4207,7 @@ mod tests {
                 pattern: BlockPattern::parse("dirt").expect("valid pattern"),
                 radius: 5.0,
                 hollow: false,
+                falling: false,
             },
             Some(&existing),
         );
