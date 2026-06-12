@@ -210,8 +210,10 @@ fn apply_block_entity(world: &World, pos: BlockPos, placement: &BlockPlacement) 
     match &placement.block_entity {
         Some(BlockEntityData::Sign(data)) => {
             if let Some(BlockEntityType::SignBlockEntity(sign)) = world.get_block_entity(pos) {
-                sign.set_front_text(text_from_face(&data.front));
-                sign.set_back_text(text_from_face(&data.back));
+                let front = text_from_face(&data.front);
+                let back = text_from_face(&data.back);
+                sign.set_front_text(&front);
+                sign.set_back_text(&back);
                 sign.set_waxed(data.waxed);
             }
         }

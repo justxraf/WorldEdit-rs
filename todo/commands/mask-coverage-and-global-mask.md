@@ -2,11 +2,11 @@
 
 ## Missing Features
 
-- [ ] `//gmask [mask]` (global mask applied to *every* edit command/brush)
-- [ ] `//count <mask>` - currently exact single-state match only
-- [ ] `//replace <mask> <to>` - currently exact single-state match (or "all
+- [x] `//gmask [mask]` (global mask applied to *every* edit command/brush)
+- [x] `//count <mask>` - currently exact single-state match only
+- [x] `//replace <mask> <to>` - currently exact single-state match (or "all
       non-air") only
-- [ ] Mask support on brushes (the `-m` brush setting is parsed but brushes
+- [x] Mask support on brushes (the `-m` brush setting is parsed but brushes
       don't consult `BlockMask` beyond what's already wired)
 
 ## Current State

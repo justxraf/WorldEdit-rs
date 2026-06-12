@@ -12,7 +12,7 @@ pub struct CompiledExpression {
 
 impl CompiledExpression {
     pub fn compile(input: &str) -> Result<Self, String> {
-        let mut parser = Parser::new(input);
+        let mut parser = Parser::new(input)?;
         let root = parser.parse_expression()?;
         parser.expect_end()?;
         Ok(Self {
@@ -25,7 +25,12 @@ impl CompiledExpression {
         self.uses_world_queries
     }
 
-    pub fn evaluate(&self, pos: BlockPos, before: u16, ctx: &PatternEvalContext) -> Result<f64, String> {
+    pub fn evaluate(
+        &self,
+        pos: BlockPos,
+        before: u16,
+        ctx: &PatternEvalContext,
+    ) -> Result<f64, String> {
         let mut eval = EvalContext {
             pos,
             before,
@@ -448,14 +453,10 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
+    fn new(input: &'a str) -> Result<Self, String> {
         let mut lexer = Lexer::new(input);
-        let current = lexer.next_token().unwrap_or(Token {
-            kind: TokenKind::End,
-            text: String::new(),
-            offset: input.len(),
-        });
-        Self { lexer, current }
+        let current = lexer.next_token()?;
+        Ok(Self { lexer, current })
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
@@ -491,23 +492,35 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_logical_or(&mut self) -> Result<Expr, String> {
-        self.parse_left_associative(Self::parse_logical_and, &[TokenKind::OrOr], |kind| match kind {
-            TokenKind::OrOr => BinaryOp::LogicalOr,
-            _ => unreachable!(),
-        })
+        self.parse_left_associative(
+            Self::parse_logical_and,
+            &[TokenKind::OrOr],
+            |kind| match kind {
+                TokenKind::OrOr => BinaryOp::LogicalOr,
+                _ => unreachable!(),
+            },
+        )
     }
 
     fn parse_logical_and(&mut self) -> Result<Expr, String> {
-        self.parse_left_associative(Self::parse_equality, &[TokenKind::AndAnd], |kind| match kind {
-            TokenKind::AndAnd => BinaryOp::LogicalAnd,
-            _ => unreachable!(),
-        })
+        self.parse_left_associative(
+            Self::parse_equality,
+            &[TokenKind::AndAnd],
+            |kind| match kind {
+                TokenKind::AndAnd => BinaryOp::LogicalAnd,
+                _ => unreachable!(),
+            },
+        )
     }
 
     fn parse_equality(&mut self) -> Result<Expr, String> {
         self.parse_left_associative(
             Self::parse_comparison,
-            &[TokenKind::EqualEqual, TokenKind::BangEqual, TokenKind::TildeEqual],
+            &[
+                TokenKind::EqualEqual,
+                TokenKind::BangEqual,
+                TokenKind::TildeEqual,
+            ],
             |kind| match kind {
                 TokenKind::EqualEqual => BinaryOp::Equal,
                 TokenKind::BangEqual => BinaryOp::NotEqual,
@@ -711,8 +724,12 @@ fn eval_call(name: &str, args: &[Expr], ctx: &mut EvalContext<'_>) -> Result<f64
         "floor" => unary(args, ctx, f64::floor),
         "ln" | "log" => unary(args, ctx, f64::ln),
         "log10" => unary(args, ctx, f64::log10),
-        "max" => varargs(args, ctx, |values| values.into_iter().fold(f64::NEG_INFINITY, f64::max)),
-        "min" => varargs(args, ctx, |values| values.into_iter().fold(f64::INFINITY, f64::min)),
+        "max" => varargs(args, ctx, |values| {
+            values.into_iter().fold(f64::NEG_INFINITY, f64::max)
+        }),
+        "min" => varargs(args, ctx, |values| {
+            values.into_iter().fold(f64::INFINITY, f64::min)
+        }),
         "rint" => unary(args, ctx, f64::round),
         "round" => unary(args, ctx, f64::round),
         "sin" => unary(args, ctx, f64::sin),
@@ -889,9 +906,7 @@ fn is_ident_continue(ch: char) -> bool {
 }
 
 #[cfg(test)]
-pub fn lookup_from_fn(
-    lookup: impl Fn(BlockPos) -> u16 + 'static,
-) -> Rc<dyn Fn(BlockPos) -> u16> {
+pub fn lookup_from_fn(lookup: impl Fn(BlockPos) -> u16 + 'static) -> Rc<dyn Fn(BlockPos) -> u16> {
     Rc::new(lookup)
 }
 

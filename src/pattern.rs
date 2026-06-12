@@ -7,20 +7,27 @@
 //! context for clipboard-backed patterns, and returns precise errors for
 //! patterns that still need richer world context.
 
-use std::cell::Cell;
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
-use pumpkin_plugin_api::common::BlockPos;
+use pumpkin_data::{Block, BlockState, block_properties};
+use pumpkin_plugin_api::{common::BlockPos, world::World};
 
 use crate::{
+    block_data::{BlockEntityData, BlockPlacement, SignBlockData, SignColor, SignFace},
     clipboard::{self, ClipboardBuffer},
-    mapping, simplex_noise,
+    expression::CompiledExpression,
+    mapping, simplex_noise, snbt,
 };
 
 #[derive(Clone, Debug)]
 pub enum BlockPattern {
     Literal {
         input: String,
-        state_id: u16,
+        placement: BlockPlacement,
     },
     Existing,
     Clipboard {
@@ -53,6 +60,30 @@ pub enum BlockPattern {
         pattern: Box<BlockPattern>,
     },
     Spread {
+        input: String,
+        dx: i32,
+        dy: i32,
+        dz: i32,
+        pattern: Box<BlockPattern>,
+    },
+    Buffer {
+        input: String,
+        pattern: Box<BlockPattern>,
+    },
+    Buffer2d {
+        input: String,
+        pattern: Box<BlockPattern>,
+    },
+    Relative {
+        input: String,
+        pattern: Box<BlockPattern>,
+    },
+    SurfaceSpread {
+        input: String,
+        distance: i32,
+        pattern: Box<BlockPattern>,
+    },
+    SolidSpread {
         input: String,
         dx: i32,
         dy: i32,
@@ -95,6 +126,14 @@ pub enum BlockPattern {
         z: bool,
         pattern: Box<BlockPattern>,
     },
+    Color {
+        input: String,
+        kind: ColorPatternKind,
+    },
+    Expression {
+        input: String,
+        expression: CompiledExpression,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -120,10 +159,25 @@ impl ClipboardPatternKind {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ColorPatternKind {
+    Match { color: u32 },
+    Saturate { color: u32 },
+    Average { color: u32 },
+    Desaturate { amount: f32 },
+    Shade { darken: bool },
+}
+
 #[derive(Clone)]
 pub struct PatternEvalContext {
     origin: BlockPos,
     clipboard: Option<PreparedClipboardPattern>,
+    world: Option<*const World>,
+    block_lookup: Option<Rc<dyn Fn(BlockPos) -> u16>>,
+    sample_cache: Rc<RefCell<HashMap<(i32, i32, i32), u16>>>,
+    runtime: Rc<RefCell<PatternRuntimeState>>,
+    min_y: i32,
+    max_y: i32,
     random_source: PatternRandomSource,
 }
 
@@ -132,6 +186,12 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: None,
+            world: None,
+            block_lookup: None,
+            sample_cache: Rc::new(RefCell::new(HashMap::new())),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: DEFAULT_MIN_Y,
+            max_y: DEFAULT_MAX_Y,
             random_source: PatternRandomSource::PositionHash,
         }
     }
@@ -140,6 +200,26 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: clipboard::get(key).and_then(PreparedClipboardPattern::from_buffer),
+            world: None,
+            block_lookup: None,
+            sample_cache: Rc::new(RefCell::new(HashMap::new())),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: DEFAULT_MIN_Y,
+            max_y: DEFAULT_MAX_Y,
+            random_source: PatternRandomSource::PositionHash,
+        }
+    }
+
+    pub fn for_operation(origin: BlockPos, key: &str, world: &World) -> Self {
+        Self {
+            origin,
+            clipboard: clipboard::get(key).and_then(PreparedClipboardPattern::from_buffer),
+            world: Some(world as *const World),
+            block_lookup: None,
+            sample_cache: Rc::new(RefCell::new(HashMap::new())),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: world.get_min_y(),
+            max_y: DEFAULT_MAX_Y,
             random_source: PatternRandomSource::PositionHash,
         }
     }
@@ -149,6 +229,46 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: PreparedClipboardPattern::from_buffer(buffer),
+            world: None,
+            block_lookup: None,
+            sample_cache: Rc::new(RefCell::new(HashMap::new())),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: DEFAULT_MIN_Y,
+            max_y: DEFAULT_MAX_Y,
+            random_source: PatternRandomSource::PositionHash,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_world_states(origin: BlockPos, blocks: &[((i32, i32, i32), u16)]) -> Self {
+        let mut sample_cache = HashMap::new();
+        for &(pos, state_id) in blocks {
+            sample_cache.insert(pos, state_id);
+        }
+        Self {
+            origin,
+            clipboard: None,
+            world: None,
+            block_lookup: None,
+            sample_cache: Rc::new(RefCell::new(sample_cache)),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: DEFAULT_MIN_Y,
+            max_y: DEFAULT_MAX_Y,
+            random_source: PatternRandomSource::PositionHash,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_block_lookup(origin: BlockPos, lookup: Rc<dyn Fn(BlockPos) -> u16>) -> Self {
+        Self {
+            origin,
+            clipboard: None,
+            world: None,
+            block_lookup: Some(lookup),
+            sample_cache: Rc::new(RefCell::new(HashMap::new())),
+            runtime: Rc::new(RefCell::new(PatternRuntimeState::default())),
+            min_y: DEFAULT_MIN_Y,
+            max_y: DEFAULT_MAX_Y,
             random_source: PatternRandomSource::PositionHash,
         }
     }
@@ -157,6 +277,12 @@ impl PatternEvalContext {
         Self {
             origin: self.origin,
             clipboard: self.clipboard.clone(),
+            world: self.world,
+            block_lookup: self.block_lookup.clone(),
+            sample_cache: Rc::clone(&self.sample_cache),
+            runtime: Rc::clone(&self.runtime),
+            min_y: self.min_y,
+            max_y: self.max_y,
             random_source,
         }
     }
@@ -167,6 +293,37 @@ impl PatternEvalContext {
 
     fn random_index(&self, pos: BlockPos, len: usize) -> usize {
         self.random_source.random_index(pos, len)
+    }
+
+    fn sample_before(&self, pos: BlockPos, fallback: u16) -> u16 {
+        let key = (pos.x, pos.y, pos.z);
+        if let Some(state_id) = self.sample_cache.borrow().get(&key).copied() {
+            return state_id;
+        }
+        let state_id = self.sample_block_state(pos).unwrap_or(fallback);
+        self.sample_cache.borrow_mut().insert(key, state_id);
+        state_id
+    }
+
+    pub(crate) fn sample_block_state(&self, pos: BlockPos) -> Option<u16> {
+        if let Some(state_id) = self
+            .sample_cache
+            .borrow()
+            .get(&(pos.x, pos.y, pos.z))
+            .copied()
+        {
+            return Some(state_id);
+        }
+        if let Some(lookup) = &self.block_lookup {
+            return Some(lookup(pos));
+        }
+        let world = self.world?;
+        if pos.y < self.min_y || pos.y > self.max_y {
+            return Some(0);
+        }
+        // SAFETY: `for_operation` stores a non-owning pointer to the live
+        // command/brush `World` handle and the context does not outlive that call.
+        Some(unsafe { (&*world).get_block_state_id(pos) })
     }
 }
 
@@ -189,6 +346,15 @@ enum PatternRandomSource {
     PositionHash,
     Simplex { inverse_scale: f64 },
 }
+
+#[derive(Clone, Default)]
+struct PatternRuntimeState {
+    seen_positions: HashSet<(i32, i32, i32)>,
+    seen_columns: HashSet<(i32, i32)>,
+}
+
+const DEFAULT_MIN_Y: i32 = -64;
+const DEFAULT_MAX_Y: i32 = 319;
 
 impl PatternRandomSource {
     fn weighted_pick(self, pos: BlockPos, total: u32) -> u32 {
@@ -279,7 +445,7 @@ impl BlockPattern {
 
     pub fn state_at_with(&self, pos: BlockPos, before: u16, ctx: &PatternEvalContext) -> u16 {
         match self {
-            Self::Literal { state_id, .. } => *state_id,
+            Self::Literal { placement, .. } => placement.state_id,
             Self::Existing => before,
             Self::Clipboard { offset, .. } => ctx.clipboard.as_ref().map_or(before, |clipboard| {
                 clipboard.state_at(pos, ctx.origin, *offset)
@@ -307,21 +473,44 @@ impl BlockPattern {
             Self::StateApply { properties, .. } => {
                 mapping::apply_state_properties(before, properties).unwrap_or(before)
             }
+            Self::Buffer { pattern, .. } => {
+                let key = (pos.x, pos.y, pos.z);
+                if !ctx.runtime.borrow_mut().seen_positions.insert(key) {
+                    return before;
+                }
+                pattern.state_at_with(pos, before, ctx)
+            }
+            Self::Buffer2d { pattern, .. } => {
+                let key = (pos.x, pos.z);
+                if !ctx.runtime.borrow_mut().seen_columns.insert(key) {
+                    return before;
+                }
+                pattern.state_at_with(pos, before, ctx)
+            }
+            Self::Relative { pattern, .. } => {
+                let relative = BlockPos {
+                    x: pos.x - ctx.origin.x,
+                    y: pos.y - ctx.origin.y,
+                    z: pos.z - ctx.origin.z,
+                };
+                let relative_before = ctx.sample_before(relative, before);
+                pattern.state_at_with(relative, relative_before, ctx)
+            }
             Self::Offset {
                 dx,
                 dy,
                 dz,
                 pattern,
                 ..
-            } => pattern.state_at_with(
-                BlockPos {
+            } => {
+                let shifted = BlockPos {
                     x: pos.x + dx,
                     y: pos.y + dy,
                     z: pos.z + dz,
-                },
-                before,
-                ctx,
-            ),
+                };
+                let shifted_before = ctx.sample_before(shifted, before);
+                pattern.state_at_with(shifted, shifted_before, ctx)
+            }
             Self::Spread {
                 dx,
                 dy,
@@ -330,15 +519,40 @@ impl BlockPattern {
                 ..
             } => {
                 let hash = position_hash(pos);
-                pattern.state_at_with(
-                    BlockPos {
-                        x: pos.x + spread_axis(hash, 0, *dx),
-                        y: pos.y + spread_axis(hash, 10, *dy),
-                        z: pos.z + spread_axis(hash, 20, *dz),
-                    },
-                    before,
-                    ctx,
-                )
+                let shifted = BlockPos {
+                    x: pos.x + spread_axis(hash, 0, *dx),
+                    y: pos.y + spread_axis(hash, 10, *dy),
+                    z: pos.z + spread_axis(hash, 20, *dz),
+                };
+                let shifted_before = ctx.sample_before(shifted, before);
+                pattern.state_at_with(shifted, shifted_before, ctx)
+            }
+            Self::SurfaceSpread {
+                distance, pattern, ..
+            } => {
+                let shifted = surface_spread_target(pos, *distance, before, pattern, ctx);
+                let shifted_before = ctx.sample_before(shifted, before);
+                pattern.state_at_with(shifted, shifted_before, ctx)
+            }
+            Self::SolidSpread {
+                dx,
+                dy,
+                dz,
+                pattern,
+                ..
+            } => {
+                let shifted = BlockPos {
+                    x: pos.x + spread_axis(position_hash(pos), 0, *dx),
+                    y: pos.y + spread_axis(position_hash(pos), 10, *dy),
+                    z: pos.z + spread_axis(position_hash(pos), 20, *dz),
+                };
+                let shifted_before = ctx.sample_before(shifted, before);
+                let shifted_state = pattern.state_at_with(shifted, shifted_before, ctx);
+                if state_is_solid(shifted_state) {
+                    shifted_state
+                } else {
+                    pattern.state_at_with(pos, before, ctx)
+                }
             }
             Self::Mask {
                 mask,
@@ -395,14 +609,233 @@ impl BlockPattern {
             }
             Self::AxisMask {
                 x, y, z, pattern, ..
-            } => pattern.state_at_with(
-                BlockPos {
+            } => {
+                let masked = BlockPos {
                     x: if *x { pos.x } else { 0 },
                     y: if *y { pos.y } else { 0 },
                     z: if *z { pos.z } else { 0 },
-                },
+                };
+                let masked_before = ctx.sample_before(masked, before);
+                pattern.state_at_with(masked, masked_before, ctx)
+            }
+            Self::Color { kind, .. } => match kind {
+                ColorPatternKind::Match { color } => {
+                    mapping::nearest_color_block(*color).unwrap_or(before)
+                }
+                ColorPatternKind::Saturate { color } => {
+                    mapping::saturate_existing_block(before, *color).unwrap_or(before)
+                }
+                ColorPatternKind::Average { color } => {
+                    mapping::average_existing_block(before, *color).unwrap_or(before)
+                }
+                ColorPatternKind::Desaturate { amount } => {
+                    mapping::desaturate_existing_block(before, *amount).unwrap_or(before)
+                }
+                ColorPatternKind::Shade { darken } => {
+                    mapping::shade_existing_block(before, *darken).unwrap_or(before)
+                }
+            },
+            Self::Expression { expression, .. } => expression
+                .evaluate(pos, before, ctx)
+                .map(expression_result_to_state_id)
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn placement_at_with(
+        &self,
+        pos: BlockPos,
+        before: &BlockPlacement,
+        ctx: &PatternEvalContext,
+    ) -> BlockPlacement {
+        match self {
+            Self::Literal { placement, .. } => placement.clone(),
+            Self::Existing => before.clone(),
+            Self::Clipboard { offset, .. } => ctx.clipboard.as_ref().map_or_else(
+                || before.clone(),
+                |clipboard| BlockPlacement::new(clipboard.state_at(pos, ctx.origin, *offset)),
+            ),
+            Self::Weighted { entries, total, .. } => {
+                let mut pick = ctx.weighted_pick(pos, *total);
+                for entry in entries {
+                    if pick < entry.weight {
+                        return entry.pattern.placement_at_with(pos, before, ctx);
+                    }
+                    pick -= entry.weight;
+                }
+                entries.last().map_or_else(
+                    || before.clone(),
+                    |entry| entry.pattern.placement_at_with(pos, before, ctx),
+                )
+            }
+            Self::RandomStates { states, .. } => {
+                let index = ctx.random_index(pos, states.len());
+                BlockPlacement::new(states[index])
+            }
+            Self::TypeApply { pattern, .. } => {
+                let mut target = pattern.placement_at_with(pos, before, ctx);
+                target.state_id = mapping::apply_existing_states(target.state_id, before.state_id)
+                    .unwrap_or(target.state_id);
+                target
+            }
+            Self::StateApply { properties, .. } => {
+                let mut target = before.clone();
+                target.state_id = mapping::apply_state_properties(before.state_id, properties)
+                    .unwrap_or(before.state_id);
+                target
+            }
+            Self::Buffer { pattern, .. } => {
+                let state_id = self.state_at_with(pos, before.state_id, ctx);
+                let mut placement = pattern.placement_at_with(pos, before, ctx);
+                placement.state_id = state_id;
+                placement
+            }
+            Self::Buffer2d { pattern, .. } => {
+                let state_id = self.state_at_with(pos, before.state_id, ctx);
+                let mut placement = pattern.placement_at_with(pos, before, ctx);
+                placement.state_id = state_id;
+                placement
+            }
+            Self::Relative { pattern, .. } => {
+                let relative = BlockPos {
+                    x: pos.x - ctx.origin.x,
+                    y: pos.y - ctx.origin.y,
+                    z: pos.z - ctx.origin.z,
+                };
+                let relative_before = ctx.sample_before(relative, before.state_id);
+                pattern.placement_at_with(relative, &BlockPlacement::new(relative_before), ctx)
+            }
+            Self::Offset {
+                dx,
+                dy,
+                dz,
+                pattern,
+                ..
+            } => {
+                let shifted = BlockPos {
+                    x: pos.x + dx,
+                    y: pos.y + dy,
+                    z: pos.z + dz,
+                };
+                let shifted_before = ctx.sample_before(shifted, before.state_id);
+                pattern.placement_at_with(shifted, &BlockPlacement::new(shifted_before), ctx)
+            }
+            Self::Spread {
+                dx,
+                dy,
+                dz,
+                pattern,
+                ..
+            } => {
+                let hash = position_hash(pos);
+                let shifted = BlockPos {
+                    x: pos.x + spread_axis(hash, 0, *dx),
+                    y: pos.y + spread_axis(hash, 10, *dy),
+                    z: pos.z + spread_axis(hash, 20, *dz),
+                };
+                let shifted_before = ctx.sample_before(shifted, before.state_id);
+                pattern.placement_at_with(shifted, &BlockPlacement::new(shifted_before), ctx)
+            }
+            Self::SurfaceSpread {
+                distance, pattern, ..
+            } => {
+                let shifted = surface_spread_target(pos, *distance, before.state_id, pattern, ctx);
+                let shifted_before = ctx.sample_before(shifted, before.state_id);
+                pattern.placement_at_with(shifted, &BlockPlacement::new(shifted_before), ctx)
+            }
+            Self::SolidSpread {
+                dx,
+                dy,
+                dz,
+                pattern,
+                ..
+            } => {
+                let shifted = BlockPos {
+                    x: pos.x + spread_axis(position_hash(pos), 0, *dx),
+                    y: pos.y + spread_axis(position_hash(pos), 10, *dy),
+                    z: pos.z + spread_axis(position_hash(pos), 20, *dz),
+                };
+                let shifted_before = ctx.sample_before(shifted, before.state_id);
+                let shifted_placement =
+                    pattern.placement_at_with(shifted, &BlockPlacement::new(shifted_before), ctx);
+                if state_is_solid(shifted_placement.state_id) {
+                    shifted_placement
+                } else {
+                    pattern.placement_at_with(pos, before, ctx)
+                }
+            }
+            Self::Mask {
+                mask,
+                true_pattern,
+                false_pattern,
+                ..
+            } => {
+                if mask.matches(before.state_id) {
+                    true_pattern.placement_at_with(pos, before, ctx)
+                } else {
+                    false_pattern.placement_at_with(pos, before, ctx)
+                }
+            }
+            Self::Simplex {
+                inverse_scale,
+                pattern,
+                ..
+            } => pattern.placement_at_with(
+                pos,
                 before,
-                ctx,
+                &ctx.with_random_source(PatternRandomSource::Simplex {
+                    inverse_scale: *inverse_scale,
+                }),
+            ),
+            Self::Linear {
+                cursor, patterns, ..
+            } => {
+                let index = cursor.get() % patterns.len();
+                cursor.set(cursor.get().wrapping_add(1));
+                patterns[index].placement_at_with(pos, before, ctx)
+            }
+            Self::Linear2d {
+                xscale,
+                zscale,
+                patterns,
+                ..
+            } => {
+                let index = (pos.x.div_euclid(*xscale) + pos.z.div_euclid(*zscale))
+                    .rem_euclid(patterns.len() as i32) as usize;
+                patterns[index].placement_at_with(pos, before, ctx)
+            }
+            Self::Linear3d {
+                xscale,
+                yscale,
+                zscale,
+                patterns,
+                ..
+            } => {
+                let index = (pos.x.div_euclid(*xscale)
+                    + pos.y.div_euclid(*yscale)
+                    + pos.z.div_euclid(*zscale))
+                .rem_euclid(patterns.len() as i32) as usize;
+                patterns[index].placement_at_with(pos, before, ctx)
+            }
+            Self::AxisMask {
+                x, y, z, pattern, ..
+            } => {
+                let masked = BlockPos {
+                    x: if *x { pos.x } else { 0 },
+                    y: if *y { pos.y } else { 0 },
+                    z: if *z { pos.z } else { 0 },
+                };
+                let masked_before = ctx.sample_before(masked, before.state_id);
+                pattern.placement_at_with(masked, &BlockPlacement::new(masked_before), ctx)
+            }
+            Self::Color { .. } => {
+                BlockPlacement::new(self.state_at_with(pos, before.state_id, ctx))
+            }
+            Self::Expression { expression, .. } => BlockPlacement::new(
+                expression
+                    .evaluate(pos, before.state_id, ctx)
+                    .map(expression_result_to_state_id)
+                    .unwrap_or(0),
             ),
         }
     }
@@ -413,6 +846,27 @@ impl BlockPattern {
             | Self::Existing
             | Self::RandomStates { .. }
             | Self::StateApply { .. } => Ok(()),
+            Self::Color { input, .. } => {
+                if mapping::has_color_palette() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Pattern '{input}' requires the bundled block color palette from assets/blocks.json."
+                    ))
+                }
+            }
+            Self::Expression { input, expression } => {
+                if expression.uses_world_queries()
+                    && ctx.world.is_none()
+                    && ctx.block_lookup.is_none()
+                {
+                    Err(format!(
+                        "Pattern '{input}' uses world-query functions, which are not available in this command context."
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             Self::Clipboard { input, kind, .. } => {
                 if ctx.clipboard.is_some() {
                     Ok(())
@@ -430,8 +884,13 @@ impl BlockPattern {
                 Ok(())
             }
             Self::TypeApply { pattern, .. }
+            | Self::Buffer { pattern, .. }
+            | Self::Buffer2d { pattern, .. }
+            | Self::Relative { pattern, .. }
             | Self::Offset { pattern, .. }
             | Self::Spread { pattern, .. }
+            | Self::SurfaceSpread { pattern, .. }
+            | Self::SolidSpread { pattern, .. }
             | Self::Simplex { pattern, .. }
             | Self::AxisMask { pattern, .. } => pattern.validate(ctx),
             Self::Mask {
@@ -455,7 +914,7 @@ impl BlockPattern {
 
     pub fn literal_display(&self) -> Option<(&str, u16)> {
         match self {
-            Self::Literal { input, state_id } => Some((input, *state_id)),
+            Self::Literal { input, placement } => Some((input, placement.state_id)),
             _ => None,
         }
     }
@@ -468,17 +927,157 @@ impl BlockPattern {
             | Self::RandomStates { input, .. }
             | Self::TypeApply { input, .. }
             | Self::StateApply { input, .. }
+            | Self::Buffer { input, .. }
+            | Self::Buffer2d { input, .. }
+            | Self::Relative { input, .. }
             | Self::Offset { input, .. }
             | Self::Spread { input, .. }
+            | Self::SurfaceSpread { input, .. }
+            | Self::SolidSpread { input, .. }
             | Self::Mask { input, .. }
             | Self::Simplex { input, .. }
             | Self::Linear { input, .. }
             | Self::Linear2d { input, .. }
             | Self::Linear3d { input, .. }
-            | Self::AxisMask { input, .. } => input,
+            | Self::AxisMask { input, .. }
+            | Self::Color { input, .. }
+            | Self::Expression { input, .. } => input,
             Self::Existing => "#existing",
         }
     }
+}
+
+fn surface_spread_target(
+    pos: BlockPos,
+    distance: i32,
+    before: u16,
+    pattern: &BlockPattern,
+    ctx: &PatternEvalContext,
+) -> BlockPos {
+    let moves = distance.clamp(0, 255) as usize;
+    let mut current = pos;
+    for step in 0..moves {
+        let mut candidates = Vec::new();
+        for (dx, dy, dz) in diagonal_directions() {
+            let next = BlockPos {
+                x: current.x + dx,
+                y: current.y + dy,
+                z: current.z + dz,
+            };
+            if surface_spread_allowed(next, before, pattern, ctx) {
+                candidates.push(next);
+            }
+        }
+        if candidates.is_empty() {
+            break;
+        }
+        let index = spread_choice_index(pos, step, candidates.len());
+        current = candidates[index];
+    }
+    current
+}
+
+fn surface_spread_allowed(
+    pos: BlockPos,
+    fallback_before: u16,
+    pattern: &BlockPattern,
+    ctx: &PatternEvalContext,
+) -> bool {
+    let before = ctx.sample_before(pos, fallback_before);
+    let state = pattern.state_at_with(pos, before, ctx);
+    if !state_blocks_movement(state) {
+        return false;
+    }
+
+    for neighbor in [
+        BlockPos {
+            x: pos.x,
+            y: pos.y + 1,
+            z: pos.z,
+        },
+        BlockPos {
+            x: pos.x,
+            y: pos.y - 1,
+            z: pos.z,
+        },
+        BlockPos {
+            x: pos.x + 1,
+            y: pos.y,
+            z: pos.z,
+        },
+        BlockPos {
+            x: pos.x - 1,
+            y: pos.y,
+            z: pos.z,
+        },
+        BlockPos {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z + 1,
+        },
+        BlockPos {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z - 1,
+        },
+    ] {
+        if neighbor.y < ctx.min_y || neighbor.y > ctx.max_y {
+            continue;
+        }
+        let neighbor_before = ctx.sample_before(neighbor, fallback_before);
+        let neighbor_state = pattern.state_at_with(neighbor, neighbor_before, ctx);
+        if !state_blocks_movement(neighbor_state) {
+            return true;
+        }
+    }
+    false
+}
+
+fn state_is_solid(state_id: u16) -> bool {
+    BlockState::from_id(state_id).is_solid()
+}
+
+fn state_blocks_movement(state_id: u16) -> bool {
+    let state = BlockState::from_id(state_id);
+    block_properties::blocks_movement(state, Block::get_raw_id_from_state_id(state_id))
+}
+
+fn diagonal_directions() -> &'static [(i32, i32, i32)] {
+    &[
+        (-1, -1, -1),
+        (0, -1, -1),
+        (1, -1, -1),
+        (-1, 0, -1),
+        (0, 0, -1),
+        (1, 0, -1),
+        (-1, 1, -1),
+        (0, 1, -1),
+        (1, 1, -1),
+        (-1, -1, 0),
+        (0, -1, 0),
+        (1, -1, 0),
+        (-1, 0, 0),
+        (1, 0, 0),
+        (-1, 1, 0),
+        (0, 1, 0),
+        (1, 1, 0),
+        (-1, -1, 1),
+        (0, -1, 1),
+        (1, -1, 1),
+        (-1, 0, 1),
+        (0, 0, 1),
+        (1, 0, 1),
+        (-1, 1, 1),
+        (0, 1, 1),
+        (1, 1, 1),
+    ]
+}
+
+fn spread_choice_index(pos: BlockPos, step: usize, len: usize) -> usize {
+    let mixed = position_hash(pos)
+        .wrapping_add((step as u32).wrapping_mul(0x9e37_79b9))
+        .rotate_left((step % 31) as u32);
+    (mixed as usize) % len
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,6 +1157,10 @@ fn parse_pattern(input: &str) -> Result<BlockPattern, String> {
         return Ok(BlockPattern::Existing);
     }
 
+    if let Some(rest) = input.strip_prefix('=') {
+        return parse_expression_pattern(input, rest);
+    }
+
     if let Some(rest) = input.strip_prefix('^') {
         return parse_type_or_state_apply(input, rest.trim());
     }
@@ -574,13 +1177,7 @@ fn parse_pattern(input: &str) -> Result<BlockPattern, String> {
         return parse_fawe_pattern(input);
     }
 
-    let Some(state_id) = mapping::resolve_block(input) else {
-        return Err(format!("Unknown block '{input}'."));
-    };
-    Ok(BlockPattern::Literal {
-        input: input.to_string(),
-        state_id,
-    })
+    parse_literal_pattern(input)
 }
 
 fn parse_type_or_state_apply(input: &str, rest: &str) -> Result<BlockPattern, String> {
@@ -600,6 +1197,19 @@ fn parse_type_or_state_apply(input: &str, rest: &str) -> Result<BlockPattern, St
     Ok(BlockPattern::TypeApply {
         input: input.to_string(),
         pattern: Box::new(parse_pattern(rest)?),
+    })
+}
+
+fn parse_expression_pattern(input: &str, rest: &str) -> Result<BlockPattern, String> {
+    let expression_input = rest.trim();
+    if expression_input.is_empty() {
+        return Err(format!(
+            "Missing expression after '=' in pattern '{input}'."
+        ));
+    }
+    Ok(BlockPattern::Expression {
+        input: input.to_string(),
+        expression: CompiledExpression::compile(expression_input)?,
     })
 }
 
@@ -628,6 +1238,275 @@ fn parse_random_state_pattern(input: &str, rest: &str) -> Result<BlockPattern, S
     })
 }
 
+fn parse_literal_pattern(input: &str) -> Result<BlockPattern, String> {
+    let parts = split_top_level(input, '|')?;
+    let base = parts[0].trim();
+    let (block_input, inline_snbt) = split_literal_block_and_nbt(base)?;
+    let Some(state_id) = mapping::resolve_block(&block_input) else {
+        return Err(format!("Unknown block '{block_input}'."));
+    };
+
+    let mut placement = BlockPlacement::new(state_id);
+    let block_name = mapping::palette_key_for_state_id(state_id);
+    let block_name = block_name
+        .split_once('[')
+        .map_or(block_name.as_str(), |(name, _)| name);
+
+    if let Some(raw_snbt) = inline_snbt.as_ref() {
+        apply_literal_snbt(block_name, &mut placement, &raw_snbt)?;
+    }
+
+    if parts.len() > 1 {
+        if parts[1].trim_start().starts_with('{') {
+            if inline_snbt.is_some() {
+                return Err(format!(
+                    "Pattern '{input}' cannot combine inline SNBT and pipe SNBT."
+                ));
+            }
+            apply_literal_snbt(block_name, &mut placement, &parts[1..].join("|"))?;
+        } else {
+            apply_literal_pipe_syntax(block_name, &mut placement, &parts[1..], input)?;
+        }
+    }
+
+    Ok(BlockPattern::Literal {
+        input: input.to_string(),
+        placement,
+    })
+}
+
+fn parse_pattern_color(input: &str, args: &[String], name: &str) -> Result<u32, String> {
+    if !(args.len() == 3 || args.len() == 4) {
+        return Err(format!("Usage: {name} <r> <g> <b> [a]."));
+    }
+
+    let red = parse_color_component(&args[0], "red", input)?;
+    let green = parse_color_component(&args[1], "green", input)?;
+    let blue = parse_color_component(&args[2], "blue", input)?;
+    let _alpha = args
+        .get(3)
+        .map(|raw| parse_color_component(raw, "alpha", input))
+        .transpose()?
+        .unwrap_or(255);
+
+    Ok((255u32 << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32)
+}
+
+fn parse_desaturate_amount(input: &str, args: &[String]) -> Result<f32, String> {
+    let Some(raw) = args.first() else {
+        return Err("Usage: #desaturate <percent>.".to_string());
+    };
+    if args.len() != 1 {
+        return Err(format!(
+            "Usage: #desaturate <percent> in pattern '{input}'."
+        ));
+    }
+    let percent = raw
+        .parse::<f32>()
+        .map_err(|_| format!("Invalid percent '{raw}' in pattern '{input}'."))?;
+    Ok((percent / 100.0).clamp(0.0, 1.0))
+}
+
+fn parse_color_component(raw: &str, name: &str, input: &str) -> Result<u8, String> {
+    let value = raw
+        .parse::<i32>()
+        .map_err(|_| format!("Invalid {name} '{raw}' in pattern '{input}'."))?;
+    Ok(value.clamp(0, 255) as u8)
+}
+
+fn ensure_no_pattern_args(input: &str, args: &[String], name: &str) -> Result<(), String> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Pattern '{input}' does not take arguments. Usage: {name}."
+        ))
+    }
+}
+
+fn split_literal_block_and_nbt(input: &str) -> Result<(String, Option<String>), String> {
+    let mut split = None;
+    let mut scan = ScanState::default();
+    for (index, ch) in input.char_indices() {
+        if ch == '{' && scan.is_top_level() {
+            split = Some(index);
+            break;
+        }
+        scan.advance(ch)?;
+    }
+
+    match split {
+        Some(index) => Ok((
+            input[..index].trim().to_string(),
+            Some(input[index..].trim().to_string()),
+        )),
+        None => Ok((input.trim().to_string(), None)),
+    }
+}
+
+fn apply_literal_pipe_syntax(
+    block_name: &str,
+    placement: &mut BlockPlacement,
+    args: &[&str],
+    input: &str,
+) -> Result<(), String> {
+    if is_sign_block(block_name) {
+        let mut sign = sign_data_from_placement(placement);
+        sign.front = SignFace::from_lines(
+            &args
+                .iter()
+                .take(4)
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>(),
+        );
+        placement.block_entity = Some(BlockEntityData::Sign(sign));
+        return Ok(());
+    }
+    if is_player_head_block(block_name) {
+        return Err(format!(
+            "Pattern '{input}' uses player head syntax, but Pumpkin does not expose profile setters yet."
+        ));
+    }
+    if is_spawner_block(block_name) {
+        return Err(format!(
+            "Pattern '{input}' uses spawner syntax, but Pumpkin does not expose spawner-type setters yet."
+        ));
+    }
+    Err(format!(
+        "Pattern '{input}' does not support pipe data for block '{block_name}'."
+    ))
+}
+
+fn apply_literal_snbt(
+    block_name: &str,
+    placement: &mut BlockPlacement,
+    raw_snbt: &str,
+) -> Result<(), String> {
+    let parsed = snbt::parse(raw_snbt)?;
+    let Some(compound) = parsed.as_compound() else {
+        return Err("Block SNBT must be a compound like '{key:value}'.".to_string());
+    };
+
+    if is_sign_block(block_name) {
+        let sign = parse_sign_snbt(sign_data_from_placement(placement), compound)?;
+        placement.block_entity = Some(BlockEntityData::Sign(sign));
+        return Ok(());
+    }
+
+    if is_player_head_block(block_name) {
+        return Err(format!(
+            "Block SNBT for '{block_name}' needs skull/profile setters Pumpkin does not expose yet."
+        ));
+    }
+
+    if is_spawner_block(block_name) {
+        return Err(format!(
+            "Block SNBT for '{block_name}' needs spawner mutation hooks Pumpkin does not expose yet."
+        ));
+    }
+
+    Err(format!(
+        "Block SNBT for '{block_name}' is not writable yet because Pumpkin only exposes sign block-entity setters."
+    ))
+}
+
+fn sign_data_from_placement(placement: &BlockPlacement) -> SignBlockData {
+    match &placement.block_entity {
+        Some(BlockEntityData::Sign(sign)) => sign.clone(),
+        None => SignBlockData::default(),
+    }
+}
+
+fn parse_sign_snbt(
+    mut sign: SignBlockData,
+    compound: &std::collections::BTreeMap<String, snbt::SnbtValue>,
+) -> Result<SignBlockData, String> {
+    for (key, value) in compound {
+        match key.as_str() {
+            "is_waxed" => {
+                sign.waxed = value
+                    .as_bool_loose()
+                    .ok_or_else(|| "sign 'is_waxed' must be a boolean or 0/1.".to_string())?;
+            }
+            "front_text" => {
+                let Some(front) = value.as_compound() else {
+                    return Err("sign 'front_text' must be an SNBT compound.".to_string());
+                };
+                sign.front = parse_sign_face(sign.front.clone(), front)?;
+            }
+            "back_text" => {
+                let Some(back) = value.as_compound() else {
+                    return Err("sign 'back_text' must be an SNBT compound.".to_string());
+                };
+                sign.back = parse_sign_face(sign.back.clone(), back)?;
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported sign SNBT field '{other}'. Pumpkin currently supports only is_waxed, front_text, and back_text."
+                ));
+            }
+        }
+    }
+    Ok(sign)
+}
+
+fn parse_sign_face(
+    mut face: SignFace,
+    compound: &std::collections::BTreeMap<String, snbt::SnbtValue>,
+) -> Result<SignFace, String> {
+    for (key, value) in compound {
+        match key.as_str() {
+            "messages" => {
+                let Some(messages) = value.as_list() else {
+                    return Err("sign text 'messages' must be an SNBT list.".to_string());
+                };
+                for slot in &mut face.messages {
+                    slot.clear();
+                }
+                for (index, message) in messages.iter().take(4).enumerate() {
+                    let Some(message) = message.as_str() else {
+                        return Err("sign text messages must be strings.".to_string());
+                    };
+                    face.messages[index] = message.to_string();
+                }
+            }
+            "color" => {
+                let Some(color) = value.as_str() else {
+                    return Err("sign text 'color' must be a string.".to_string());
+                };
+                face.color = SignColor::parse(color)
+                    .ok_or_else(|| format!("Unknown sign color '{color}'."))?;
+            }
+            "has_glowing_text" => {
+                face.glowing = value.as_bool_loose().ok_or_else(|| {
+                    "sign text 'has_glowing_text' must be a boolean or 0/1.".to_string()
+                })?;
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported sign text SNBT field '{other}'. Supported fields are messages, color, and has_glowing_text."
+                ));
+            }
+        }
+    }
+    Ok(face)
+}
+
+fn is_sign_block(block_name: &str) -> bool {
+    block_name.ends_with("_sign") || block_name.ends_with("_hanging_sign")
+}
+
+fn is_player_head_block(block_name: &str) -> bool {
+    matches!(
+        block_name,
+        "minecraft:player_head" | "minecraft:player_wall_head"
+    )
+}
+
+fn is_spawner_block(block_name: &str) -> bool {
+    block_name == "minecraft:spawner"
+}
+
 fn parse_fawe_pattern(input: &str) -> Result<BlockPattern, String> {
     if let Some(pattern) = parse_clipboard_alias_pattern(input)? {
         return Ok(pattern);
@@ -648,6 +1527,36 @@ fn parse_fawe_pattern(input: &str) -> Result<BlockPattern, String> {
         "#spread" => {
             let (dx, dy, dz, pattern) = parse_offset_like_args(input, &args, "#spread")?;
             Ok(BlockPattern::Spread {
+                input: input.to_string(),
+                dx,
+                dy,
+                dz,
+                pattern: Box::new(parse_pattern(&pattern)?),
+            })
+        }
+        "#buffer" => Ok(BlockPattern::Buffer {
+            input: input.to_string(),
+            pattern: Box::new(parse_single_child_pattern(input, &args, "#buffer")?),
+        }),
+        "#buffer2d" => Ok(BlockPattern::Buffer2d {
+            input: input.to_string(),
+            pattern: Box::new(parse_single_child_pattern(input, &args, "#buffer2d")?),
+        }),
+        "#relative" | "#~" | "#r" | "#rel" => Ok(BlockPattern::Relative {
+            input: input.to_string(),
+            pattern: Box::new(parse_single_child_pattern(input, &args, "#relative")?),
+        }),
+        "#surfacespread" => {
+            let (distance, pattern) = parse_surface_spread_args(input, &args)?;
+            Ok(BlockPattern::SurfaceSpread {
+                input: input.to_string(),
+                distance,
+                pattern: Box::new(parse_pattern(&pattern)?),
+            })
+        }
+        "#solidspread" => {
+            let (dx, dy, dz, pattern) = parse_solid_spread_args(input, &args)?;
+            Ok(BlockPattern::SolidSpread {
                 input: input.to_string(),
                 dx,
                 dy,
@@ -717,12 +1626,46 @@ fn parse_fawe_pattern(input: &str) -> Result<BlockPattern, String> {
             "Pattern '{input}' needs biome editing support, but Pumpkin only exposes \
              world.get-biome today and does not provide world.set-biome yet."
         )),
-        "#color" | "#saturate" | "#darken" | "#anglecolor" | "#desaturate" | "#averagecolor"
-        | "#lighten" => Err(format!(
-            "Pattern '{input}' needs FAWE's block color matcher, which is not implemented yet."
-        )),
-        "#buffer" | "#buffer2d" | "#relative" | "#surfacespread" | "#solidspread" => Err(format!(
-            "Pattern '{input}' needs operation-wide FAWE pattern state or world surface checks, which is not implemented yet."
+        "#color" | "#colour" => Ok(BlockPattern::Color {
+            input: input.to_string(),
+            kind: ColorPatternKind::Match {
+                color: parse_pattern_color(input, &args, "#color")?,
+            },
+        }),
+        "#saturate" => Ok(BlockPattern::Color {
+            input: input.to_string(),
+            kind: ColorPatternKind::Saturate {
+                color: parse_pattern_color(input, &args, "#saturate")?,
+            },
+        }),
+        "#averagecolor" | "#averagecolour" => Ok(BlockPattern::Color {
+            input: input.to_string(),
+            kind: ColorPatternKind::Average {
+                color: parse_pattern_color(input, &args, "#averagecolor")?,
+            },
+        }),
+        "#desaturate" => Ok(BlockPattern::Color {
+            input: input.to_string(),
+            kind: ColorPatternKind::Desaturate {
+                amount: parse_desaturate_amount(input, &args)?,
+            },
+        }),
+        "#darken" => {
+            ensure_no_pattern_args(input, &args, "#darken")?;
+            Ok(BlockPattern::Color {
+                input: input.to_string(),
+                kind: ColorPatternKind::Shade { darken: true },
+            })
+        }
+        "#lighten" => {
+            ensure_no_pattern_args(input, &args, "#lighten")?;
+            Ok(BlockPattern::Color {
+                input: input.to_string(),
+                kind: ColorPatternKind::Shade { darken: false },
+            })
+        }
+        "#anglecolor" | "#anglecolour" => Err(format!(
+            "Pattern '{input}' still needs terrain-angle sampling from the world, which is not implemented in this engine yet."
         )),
         _ => Err(format!(
             "Pattern '{input}' needs FAWE's full pattern engine, which is not implemented yet."
@@ -867,6 +1810,60 @@ fn parse_offset_like_args(
     ))
 }
 
+fn parse_single_child_pattern(
+    input: &str,
+    args: &[String],
+    name: &str,
+) -> Result<BlockPattern, String> {
+    if args.len() != 1 {
+        return Err(format!("Usage: {name} <pattern>."));
+    }
+    parse_pattern(args[0].trim()).map_err(|_| format!("Invalid child pattern in '{input}'."))
+}
+
+fn parse_surface_spread_args(whole: &str, args: &[String]) -> Result<(i32, String), String> {
+    match args {
+        [pattern, distance] => Ok((
+            parse_positive_i32_arg(distance, "distance", whole)?,
+            pattern.clone(),
+        )),
+        [distance, rest @ ..] if !rest.is_empty() => Ok((
+            parse_positive_i32_arg(distance, "distance", whole)?,
+            rest.join(" "),
+        )),
+        _ => Err("Usage: #surfacespread <distance> <pattern>.".to_string()),
+    }
+}
+
+fn parse_solid_spread_args(
+    whole: &str,
+    args: &[String],
+) -> Result<(i32, i32, i32, String), String> {
+    match args {
+        [pattern, radius] => {
+            let radius = parse_positive_i32_arg(radius, "distance", whole)?;
+            Ok((radius, radius, radius, pattern.clone()))
+        }
+        [pattern, dx, dy, dz] => Ok((
+            parse_positive_i32_arg(dx, "dx", whole)?,
+            parse_positive_i32_arg(dy, "dy", whole)?,
+            parse_positive_i32_arg(dz, "dz", whole)?,
+            pattern.clone(),
+        )),
+        [radius, rest @ ..] if rest.len() == 1 => {
+            let radius = parse_positive_i32_arg(radius, "distance", whole)?;
+            Ok((radius, radius, radius, rest[0].clone()))
+        }
+        [dx, dy, dz, rest @ ..] if !rest.is_empty() => Ok((
+            parse_positive_i32_arg(dx, "dx", whole)?,
+            parse_positive_i32_arg(dy, "dy", whole)?,
+            parse_positive_i32_arg(dz, "dz", whole)?,
+            rest.join(" "),
+        )),
+        _ => Err("Usage: #solidspread <dx> <dy> <dz> <pattern>.".to_string()),
+    }
+}
+
 fn parse_sequence_arg(
     input: &str,
     args: &[String],
@@ -908,6 +1905,14 @@ fn parse_optional_scale(args: &[String], index: usize, name: &str) -> Result<i32
 fn parse_i32_arg(raw: &str, name: &str, whole: &str) -> Result<i32, String> {
     raw.parse::<i32>()
         .map_err(|_| format!("Invalid {name} '{raw}' in pattern '{whole}'."))
+}
+
+fn parse_positive_i32_arg(raw: &str, name: &str, whole: &str) -> Result<i32, String> {
+    let value = parse_i32_arg(raw, name, whole)?;
+    if value <= 0 {
+        return Err(format!("{name} must be positive in pattern '{whole}'."));
+    }
+    Ok(value)
 }
 
 fn parse_simplex_scale(raw: &str, whole: &str) -> Result<f64, String> {
@@ -963,64 +1968,101 @@ fn parse_bracket_args(input: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-fn split_top_level(input: &str, delimiter: char) -> Result<Vec<&str>, String> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (index, ch) in input.char_indices() {
+#[derive(Default)]
+struct ScanState {
+    bracket_depth: i32,
+    brace_depth: i32,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+impl ScanState {
+    fn advance(&mut self, ch: char) -> Result<(), String> {
+        if let Some(quote) = self.quote {
+            if self.escaped {
+                self.escaped = false;
+            } else if ch == '\\' {
+                self.escaped = true;
+            } else if ch == quote {
+                self.quote = None;
+            }
+            return Ok(());
+        }
+
         match ch {
-            '[' => depth += 1,
+            '\'' | '"' => self.quote = Some(ch),
+            '[' => self.bracket_depth += 1,
             ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(format!("Unmatched ']' in '{input}'."));
+                self.bracket_depth -= 1;
+                if self.bracket_depth < 0 {
+                    return Err("Unmatched ']' in pattern.".to_string());
                 }
             }
-            _ if ch == delimiter && depth == 0 => {
-                parts.push(&input[start..index]);
-                start = index + ch.len_utf8();
+            '{' => self.brace_depth += 1,
+            '}' => {
+                self.brace_depth -= 1;
+                if self.brace_depth < 0 {
+                    return Err("Unmatched '}' in pattern.".to_string());
+                }
             }
             _ => {}
         }
+        Ok(())
     }
-    if depth != 0 {
-        return Err(format!("Unclosed '[' in '{input}'."));
+
+    fn is_top_level(&self) -> bool {
+        self.quote.is_none() && self.bracket_depth == 0 && self.brace_depth == 0
     }
+
+    fn finish(self, input: &str) -> Result<(), String> {
+        if self.quote.is_some() {
+            return Err(format!("Unclosed quoted string in '{input}'."));
+        }
+        if self.bracket_depth != 0 {
+            return Err(format!("Unclosed '[' in '{input}'."));
+        }
+        if self.brace_depth != 0 {
+            return Err(format!("Unclosed '{{' in '{input}'."));
+        }
+        Ok(())
+    }
+}
+
+fn split_top_level(input: &str, delimiter: char) -> Result<Vec<&str>, String> {
+    let mut parts = Vec::new();
+    let mut scan = ScanState::default();
+    let mut start = 0usize;
+    for (index, ch) in input.char_indices() {
+        scan.advance(ch)
+            .map_err(|message| format!("{message} in '{input}'."))?;
+        if ch == delimiter && scan.is_top_level() {
+            parts.push(&input[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    scan.finish(input)?;
     parts.push(&input[start..]);
     Ok(parts)
 }
 
 fn split_whitespace_respecting_brackets(input: &str) -> Result<Vec<&str>, String> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
+    let mut scan = ScanState::default();
     let mut start = None;
 
     for (index, ch) in input.char_indices() {
-        match ch {
-            '[' => {
-                depth += 1;
-                start.get_or_insert(index);
+        if ch.is_whitespace() && scan.is_top_level() {
+            if let Some(s) = start.take() {
+                parts.push(&input[s..index]);
             }
-            ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(format!("Unmatched ']' in '{input}'."));
-                }
-            }
-            _ if ch.is_whitespace() && depth == 0 => {
-                if let Some(s) = start.take() {
-                    parts.push(&input[s..index]);
-                }
-            }
-            _ => {
-                start.get_or_insert(index);
-            }
+            continue;
         }
+        start.get_or_insert(index);
+        scan.advance(ch)
+            .map_err(|message| format!("{message} in '{input}'."))?;
     }
 
-    if depth != 0 {
-        return Err(format!("Unclosed '[' in '{input}'."));
-    }
+    scan.finish(input)?;
     if let Some(s) = start {
         parts.push(&input[s..]);
     }
@@ -1028,23 +2070,15 @@ fn split_whitespace_respecting_brackets(input: &str) -> Result<Vec<&str>, String
 }
 
 fn find_top_level_percent(input: &str) -> Result<Option<usize>, String> {
-    let mut depth = 0i32;
+    let mut scan = ScanState::default();
     for (index, ch) in input.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(format!("Unmatched ']' in '{input}'."));
-                }
-            }
-            '%' if depth == 0 => return Ok(Some(index)),
-            _ => {}
+        scan.advance(ch)
+            .map_err(|message| format!("{message} in '{input}'."))?;
+        if ch == '%' && scan.is_top_level() {
+            return Ok(Some(index));
         }
     }
-    if depth != 0 {
-        return Err(format!("Unclosed '[' in '{input}'."));
-    }
+    scan.finish(input)?;
     Ok(None)
 }
 
@@ -1116,6 +2150,17 @@ fn wrap_pattern_axis(value: i64, offset: i32, len: usize) -> usize {
     (value + i64::from(offset)).rem_euclid(len as i64) as usize
 }
 
+fn expression_result_to_state_id(value: f64) -> u16 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let truncated = value.trunc();
+    if !(0.0..=u16::MAX as f64).contains(&truncated) {
+        return 0;
+    }
+    truncated as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,9 +2178,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_sign_pipe_syntax() {
+        let pattern = BlockPattern::parse("oak_sign|Line1|Line 2").unwrap();
+        let placement = pattern.placement_at_with(
+            at(0, 0, 0),
+            &BlockPlacement::new(0),
+            &PatternEvalContext::default(),
+        );
+        let Some(BlockEntityData::Sign(sign)) = placement.block_entity else {
+            panic!("expected sign payload");
+        };
+        assert_eq!(sign.front.messages[0], "Line1");
+        assert_eq!(sign.front.messages[1], "Line 2");
+    }
+
+    #[test]
+    fn parses_states_before_inline_sign_snbt() {
+        let pattern = BlockPattern::parse("oak_sign[rotation=12]{'is_waxed':1}").unwrap();
+        let placement = pattern.placement_at_with(
+            at(0, 0, 0),
+            &BlockPlacement::new(0),
+            &PatternEvalContext::default(),
+        );
+        let Some(BlockEntityData::Sign(sign)) = placement.block_entity else {
+            panic!("expected sign payload");
+        };
+        assert!(sign.waxed);
+        assert_eq!(
+            mapping::palette_key_for_state_id(placement.state_id),
+            "minecraft:oak_sign[rotation=12,waterlogged=false]"
+        );
+    }
+
+    #[test]
+    fn weighted_parser_ignores_snbt_commas() {
+        let pattern = BlockPattern::parse("oak_sign{'is_waxed':1},stone");
+        assert!(pattern.is_ok());
+    }
+
+    #[test]
     fn existing_pattern_keeps_before_state() {
         let pattern = BlockPattern::parse("#existing").unwrap();
         assert_eq!(pattern.state_at(at(0, 0, 0), 10), 10);
+    }
+
+    #[test]
+    fn parses_expression_pattern() {
+        let pattern = BlockPattern::parse("= x > 0 ? 1 : 10").unwrap();
+        assert_eq!(pattern.description(), "= x > 0 ? 1 : 10");
+    }
+
+    #[test]
+    fn expression_pattern_uses_coordinates() {
+        let pattern = BlockPattern::parse("= x + y + z").unwrap();
+        assert_eq!(pattern.state_at(at(1, 2, 3), 0), 6);
+    }
+
+    #[test]
+    fn expression_pattern_supports_world_queries() {
+        let pattern = BlockPattern::parse("= queryRel(1,0,0,10,-1) ? 1 : 0").unwrap();
+        let ctx = PatternEvalContext::with_world_states(at(0, 0, 0), &[((6, 0, 0), 10)]);
+        assert_eq!(pattern.state_at_with(at(5, 0, 0), 0, &ctx), 1);
     }
 
     #[test]
@@ -1230,6 +2333,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_stateful_world_context_patterns() {
+        assert!(matches!(
+            BlockPattern::parse("#buffer[stone]").unwrap(),
+            BlockPattern::Buffer { .. }
+        ));
+        assert!(matches!(
+            BlockPattern::parse("#buffer2d dirt").unwrap(),
+            BlockPattern::Buffer2d { .. }
+        ));
+        assert!(matches!(
+            BlockPattern::parse("#relative[#existing]").unwrap(),
+            BlockPattern::Relative { .. }
+        ));
+        assert!(matches!(
+            BlockPattern::parse("#surfacespread[#existing][2]").unwrap(),
+            BlockPattern::SurfaceSpread { .. }
+        ));
+        assert!(matches!(
+            BlockPattern::parse("#solidspread 1 2 3 #existing").unwrap(),
+            BlockPattern::SolidSpread { .. }
+        ));
+    }
+
+    #[test]
     fn parses_mask_pattern() {
         let pattern = BlockPattern::parse("#mask[#existing][stone][dirt]").unwrap();
         assert_eq!(pattern.state_at(at(0, 0, 0), 10), 1);
@@ -1274,6 +2401,53 @@ mod tests {
     fn state_apply_keeps_existing_type() {
         let pattern = BlockPattern::parse("^[waterlogged=false]").unwrap();
         assert_eq!(pattern.state_at(at(0, 0, 0), 1), 1);
+    }
+
+    #[test]
+    fn buffer_pattern_skips_repeated_positions() {
+        let pattern = BlockPattern::parse("#buffer[stone]").unwrap();
+        let ctx = PatternEvalContext::new(at(0, 0, 0));
+        assert_eq!(pattern.state_at_with(at(1, 2, 3), 0, &ctx), 1);
+        assert_eq!(pattern.state_at_with(at(1, 2, 3), 10, &ctx), 10);
+    }
+
+    #[test]
+    fn buffer2d_pattern_skips_repeated_columns() {
+        let pattern = BlockPattern::parse("#buffer2d[stone]").unwrap();
+        let ctx = PatternEvalContext::new(at(0, 0, 0));
+        assert_eq!(pattern.state_at_with(at(1, 2, 3), 0, &ctx), 1);
+        assert_eq!(pattern.state_at_with(at(1, 20, 3), 10, &ctx), 10);
+    }
+
+    #[test]
+    fn offset_pattern_samples_shifted_world_state() {
+        let pattern = BlockPattern::parse("#offset[1][0][0][#existing]").unwrap();
+        let ctx = PatternEvalContext::with_world_states(at(0, 0, 0), &[((1, 0, 0), 10)]);
+        assert_eq!(pattern.state_at_with(at(0, 0, 0), 0, &ctx), 10);
+    }
+
+    #[test]
+    fn relative_pattern_uses_operation_origin() {
+        let pattern = BlockPattern::parse("#relative[#offset[1][0][0][#existing]]").unwrap();
+        let ctx = PatternEvalContext::with_world_states(at(10, 0, 10), &[((1, 0, 0), 10)]);
+        assert_eq!(pattern.state_at_with(at(10, 0, 10), 0, &ctx), 10);
+    }
+
+    #[test]
+    fn surface_spread_samples_surface_neighbor() {
+        let pattern = BlockPattern::parse("#surfacespread[#existing][1]").unwrap();
+        let ctx = PatternEvalContext::with_world_states(at(0, 0, 0), &[((1, 0, 0), 10)]);
+        assert_eq!(pattern.state_at_with(at(0, 0, 0), 0, &ctx), 10);
+    }
+
+    #[test]
+    fn solid_spread_falls_back_when_sampled_block_is_not_solid() {
+        let pattern = BlockPattern::parse("#solidspread[#existing][1]").unwrap();
+        let ctx = PatternEvalContext::with_world_states(
+            at(0, 0, 0),
+            &[((0, 0, 0), 1), ((-1, -1, -1), 0)],
+        );
+        assert_eq!(pattern.state_at_with(at(0, 0, 0), 1, &ctx), 1);
     }
 
     #[test]
@@ -1348,6 +2522,35 @@ mod tests {
         assert!(BlockPattern::parse("#clipboard@[1,2]").is_err());
         assert!(BlockPattern::parse("#clipboard@[1,two,3]").is_err());
         assert!(BlockPattern::parse("#clipboard@[").is_err());
+    }
+
+    #[test]
+    fn color_pattern_matches_exact_palette_color() {
+        let pattern = BlockPattern::parse("#color[255][255][255]").unwrap();
+        let expected = crate::mapping::resolve_block("white_wool").unwrap();
+        assert_eq!(pattern.state_at(at(0, 0, 0), 1), expected);
+    }
+
+    #[test]
+    fn color_pattern_accepts_rgb_without_alpha() {
+        let pattern = BlockPattern::parse("#averagecolor[255][255][255]").unwrap();
+        let before = crate::mapping::resolve_block("stone").unwrap();
+        assert_eq!(pattern.validate(&PatternEvalContext::default()), Ok(()));
+        assert_ne!(pattern.state_at(at(0, 0, 0), before), 0);
+    }
+
+    #[test]
+    fn saturate_pattern_changes_supported_blocks() {
+        let pattern = BlockPattern::parse("#saturate[255][64][64]").unwrap();
+        let before = crate::mapping::resolve_block("stone").unwrap();
+        assert_ne!(pattern.state_at(at(0, 0, 0), before), before);
+    }
+
+    #[test]
+    fn color_patterns_leave_unsupported_transparent_blocks_unchanged() {
+        let pattern = BlockPattern::parse("#darken").unwrap();
+        let glass = crate::mapping::resolve_block("glass").unwrap();
+        assert_eq!(pattern.state_at(at(0, 0, 0), glass), glass);
     }
 
     #[test]

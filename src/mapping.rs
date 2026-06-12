@@ -25,7 +25,15 @@
 //! long as it fits in the `0..=MAX_STATE_ID` range emitted by `build.rs`
 //! (or `0..=4095`, a generous guess, when the full registry isn't embedded).
 
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    sync::{OnceLock, RwLock},
+};
+
 use pumpkin_plugin_api::text::TextComponent;
+use serde::Deserialize;
 
 /// One block as emitted by `build.rs`. `variants` is `(property-string, state-id)`
 /// where `property-string` is the canonical `k=v,k=v` form with keys sorted.
@@ -33,6 +41,14 @@ pub struct GeneratedBlock {
     pub name: &'static str,
     pub default_id: u16,
     pub variants: &'static [(&'static str, u16)],
+    pub palette_color: u32,
+}
+
+pub struct GeneratedColorBlock {
+    pub block_index: u16,
+    pub state_id: u16,
+    pub color: u32,
+    pub intensity: u16,
 }
 
 pub struct GeneratedBlockTag {
@@ -40,9 +56,17 @@ pub struct GeneratedBlockTag {
     pub blocks: &'static [&'static str],
 }
 
+#[derive(Deserialize)]
+struct RuntimeBlockTagsFile {
+    #[serde(default)]
+    block: BTreeMap<String, Vec<String>>,
+}
+
 // Pulls in `pub static GENERATED_BLOCKS: &[GeneratedBlock]`.
 include!(concat!(env!("OUT_DIR"), "/block_map.rs"));
 include!(concat!(env!("OUT_DIR"), "/block_tags.rs"));
+
+static RUNTIME_BLOCK_TAGS: OnceLock<RwLock<BTreeMap<String, Vec<String>>>> = OnceLock::new();
 
 /// Minimal hand-written table so Stage-1 testing works before `blocks.json` is
 /// vendored. These ids are the vanilla 1.21 flattened global state ids, which is
@@ -92,6 +116,7 @@ pub fn state_id_for(palette_key: &str) -> Option<u16> {
 /// `MAX_STATE_ID` is `0`, so fall back to a generous guess covering vanilla
 /// 1.21's state space.
 const FALLBACK_MAX_STATE_ID: u16 = 4095;
+const INVALID_BLOCK_INDEX: u16 = u16::MAX;
 
 /// Resolve a block argument that's either a raw global state id (e.g. `"1"`
 /// for stone) or a palette key/name (see [`state_id_for`]).
@@ -146,16 +171,18 @@ pub fn state_ids_for_block(input: &str) -> Vec<u16> {
 ///
 /// `##tag` returns the tag's direct block members (one default state per block),
 /// while `##*tag` expands each tagged block to every known state in the embedded
-/// block registry.
+/// block registry. Runtime overrides from `plugins/worldedit-rs/block_tags.json`
+/// are merged on top of the generated table during plugin load.
 pub fn state_ids_for_tag(tag: &str, all_states: bool) -> Vec<u16> {
     let tag = normalize_tag(tag);
-    let Some(tag) = find_generated_tag(&tag) else {
+    let tags = runtime_block_tags().read().unwrap();
+    let Some(blocks) = tags.get(&tag) else {
         return Vec::new();
     };
 
     if all_states {
         let mut states = Vec::new();
-        for &block in tag.blocks {
+        for block in blocks {
             for state_id in state_ids_for_block(block) {
                 push_unique_state(&mut states, state_id);
             }
@@ -163,12 +190,37 @@ pub fn state_ids_for_tag(tag: &str, all_states: bool) -> Vec<u16> {
         states
     } else {
         let mut states = Vec::new();
-        for &block in tag.blocks {
+        for block in blocks {
             if let Some(state_id) = state_id_for(block) {
                 push_unique_state(&mut states, state_id);
             }
         }
         states
+    }
+}
+
+/// Load or refresh runtime block-tag overrides from the plugin data folder.
+///
+/// The file shape matches Pumpkin's tag dump:
+/// `{ "block": { "custom:tag": ["minecraft:stone", "dirt"] } }`.
+///
+/// Missing files are fine and simply leave the generated tag table in place.
+pub fn load_runtime_block_tags(data_folder: &str) -> Result<usize, String> {
+    let mut tags = generated_block_tag_map();
+    let path = Path::new(data_folder).join("block_tags.json");
+
+    if path.exists() {
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let file: RuntimeBlockTagsFile = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        let custom_count = file.block.len();
+        merge_runtime_block_tags(&mut tags, file.block);
+        *runtime_block_tags().write().unwrap() = tags;
+        Ok(custom_count)
+    } else {
+        *runtime_block_tags().write().unwrap() = tags;
+        Ok(0)
     }
 }
 
@@ -221,6 +273,177 @@ pub fn has_full_registry() -> bool {
     !GENERATED_BLOCKS.is_empty()
 }
 
+pub fn has_color_palette() -> bool {
+    !COLOR_BLOCKS.is_empty()
+}
+
+pub fn nearest_color_block(color: u32) -> Option<u16> {
+    nearest_color_candidate(normalize_color(color), false).map(|candidate| candidate.state_id)
+}
+
+pub fn saturate_existing_block(before: u16, color: u32) -> Option<u16> {
+    let before_index = block_index_for_state_id(before)?;
+    let current = color_for_state_id(before)?;
+    let target = multiply_color(current, normalize_color(color));
+    let candidate = nearest_color_candidate(target, false)?;
+    (usize::from(candidate.block_index) != before_index).then_some(candidate.state_id)
+}
+
+pub fn average_existing_block(before: u16, color: u32) -> Option<u16> {
+    let before_index = block_index_for_state_id(before)?;
+    let current = color_for_state_id(before)?;
+    let target = average_color(current, normalize_color(color));
+    let candidate = nearest_color_candidate(target, false)?;
+    (usize::from(candidate.block_index) != before_index).then_some(candidate.state_id)
+}
+
+pub fn desaturate_existing_block(before: u16, amount: f32) -> Option<u16> {
+    let before_index = block_index_for_state_id(before)?;
+    let current = color_for_state_id(before)?;
+    let target = desaturate_color(current, amount);
+    if target == current {
+        return None;
+    }
+
+    let candidate = nearest_color_candidate(target, true)?;
+    (usize::from(candidate.block_index) != before_index).then_some(candidate.state_id)
+}
+
+pub fn shade_existing_block(before: u16, darken: bool) -> Option<u16> {
+    let before_index = block_index_for_state_id(before)?;
+    let current = color_for_state_id(before)?;
+    let current_intensity = color_intensity(current);
+
+    let mut best = None::<(u64, &'static GeneratedColorBlock)>;
+    for candidate in COLOR_BLOCKS {
+        if usize::from(candidate.block_index) == before_index {
+            continue;
+        }
+        let matches_intensity = if darken {
+            candidate.intensity < current_intensity
+        } else {
+            candidate.intensity > current_intensity
+        };
+        if !matches_intensity {
+            continue;
+        }
+
+        let distance = color_distance(current, candidate.color);
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, candidate));
+        }
+    }
+
+    best.map(|(_, candidate)| candidate.state_id)
+}
+
+fn block_index_for_state_id(state_id: u16) -> Option<usize> {
+    let index = *STATE_TO_BLOCK_INDEX.get(state_id as usize)?;
+    (index != INVALID_BLOCK_INDEX).then_some(index as usize)
+}
+
+fn block_for_state_id(state_id: u16) -> Option<&'static GeneratedBlock> {
+    GENERATED_BLOCKS.get(block_index_for_state_id(state_id)?)
+}
+
+fn color_for_state_id(state_id: u16) -> Option<u32> {
+    let block = block_for_state_id(state_id)?;
+    (block.palette_color != 0).then_some(block.palette_color)
+}
+
+fn nearest_color_candidate(
+    color: u32,
+    exclude_exact_color: bool,
+) -> Option<&'static GeneratedColorBlock> {
+    let color = normalize_color(color);
+    let mut best = None::<(u64, &'static GeneratedColorBlock)>;
+    for candidate in COLOR_BLOCKS {
+        if exclude_exact_color && candidate.color == color {
+            continue;
+        }
+
+        let distance = color_distance(color, candidate.color);
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+fn normalize_color(color: u32) -> u32 {
+    (255u32 << 24) | (color & 0x00ff_ffff)
+}
+
+fn color_intensity(color: u32) -> u16 {
+    let red = ((color >> 16) & 0xFF) as u16;
+    let green = ((color >> 8) & 0xFF) as u16;
+    let blue = (color & 0xFF) as u16;
+    2 * red + 4 * green + 3 * blue
+}
+
+fn multiply_color(left: u32, right: u32) -> u32 {
+    let red = (((left >> 16) & 0xFF) * ((right >> 16) & 0xFF)) / 255;
+    let green = (((left >> 8) & 0xFF) * ((right >> 8) & 0xFF)) / 255;
+    let blue = ((left & 0xFF) * (right & 0xFF)) / 255;
+    (255u32 << 24) | (red << 16) | (green << 8) | blue
+}
+
+fn average_color(left: u32, right: u32) -> u32 {
+    let red = (((left >> 16) & 0xFF) + ((right >> 16) & 0xFF)) >> 1;
+    let green = (((left >> 8) & 0xFF) + ((right >> 8) & 0xFF)) >> 1;
+    let blue = ((left & 0xFF) + (right & 0xFF)) >> 1;
+    (255u32 << 24) | (red << 16) | (green << 8) | blue
+}
+
+fn desaturate_color(color: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let red = ((color >> 16) & 0xFF) as f32;
+    let green = ((color >> 8) & 0xFF) as f32;
+    let blue = (color & 0xFF) as f32;
+    let luminance = 0.3 * red + 0.6 * green + 0.1 * blue;
+    let new_red = (red + amount * (luminance - red)).round().clamp(0.0, 255.0) as u32;
+    let new_green = (green + amount * (luminance - green))
+        .round()
+        .clamp(0.0, 255.0) as u32;
+    let new_blue = (blue + amount * (luminance - blue))
+        .round()
+        .clamp(0.0, 255.0) as u32;
+    (255u32 << 24) | (new_red << 16) | (new_green << 8) | new_blue
+}
+
+fn color_distance(left: u32, right: u32) -> u64 {
+    let red1 = ((left >> 16) & 0xFF) as i32;
+    let green1 = ((left >> 8) & 0xFF) as i32;
+    let blue1 = (left & 0xFF) as i32;
+    let red2 = ((right >> 16) & 0xFF) as i32;
+    let green2 = ((right >> 8) & 0xFF) as i32;
+    let blue2 = (right & 0xFF) as i32;
+    let rmean = (red1 + red2) >> 1;
+    let red = red1 - red2;
+    let green = green1 - green2;
+    let blue = blue1 - blue2;
+    let hue = hue_distance(red1, green1, blue1, red2, green2, blue2) as i64;
+    ((((512 + rmean) as i64) * i64::from(red * red)) >> 8) as u64
+        + (4 * i64::from(green * green)) as u64
+        + ((((767 - rmean) as i64) * i64::from(blue * blue)) >> 8) as u64
+        + (hue * hue) as u64
+}
+
+fn hue_distance(red1: i32, green1: i32, blue1: i32, red2: i32, green2: i32, blue2: i32) -> i32 {
+    let total1 = red1 + green1 + blue1;
+    let total2 = red2 + green2 + blue2;
+    if total1 == 0 || total2 == 0 {
+        return 0;
+    }
+
+    let factor1 = 255.0 / total1 as f32;
+    let factor2 = 255.0 / total2 as f32;
+    let red = 0.5 * ((red1 as f32 * factor1) - (red2 as f32 * factor2));
+    let green = (green1 as f32 * factor1) - (green2 as f32 * factor2);
+    let blue = 0.749_023_44 * ((blue1 as f32 * factor1) - (blue2 as f32 * factor2));
+    ((red * red + green * green + blue * blue) / 33_554_432.0) as i32
+}
+
 /// A chat-friendly representation of a block, for messages like
 /// `//set <block>`'s "Set N blocks to <name>."
 ///
@@ -247,11 +470,7 @@ pub fn display_component(input: &str, state_id: u16) -> TextComponent {
 /// Reverse-lookup: find the generated block whose default state or one of its
 /// variants matches `state_id`, returning its namespaced name.
 fn name_for_state_id(state_id: u16) -> Option<&'static str> {
-    GENERATED_BLOCKS.iter().find_map(|block| {
-        let matches =
-            block.default_id == state_id || block.variants.iter().any(|&(_, id)| id == state_id);
-        matches.then_some(block.name)
-    })
+    block_for_state_id(state_id).map(|block| block.name)
 }
 
 /// Reverse-lookup a global state id to a Sponge schematic palette key, e.g.
@@ -266,7 +485,7 @@ pub fn palette_key_for_state_id(state_id: u16) -> String {
         return "minecraft:air".to_string();
     }
 
-    for block in GENERATED_BLOCKS {
+    if let Some(block) = block_for_state_id(state_id) {
         if let Some((props, _)) = block.variants.iter().find(|&&(_, id)| id == state_id) {
             return format!("{}[{}]", block.name, props);
         }
@@ -299,8 +518,43 @@ fn find_generated(name: &str) -> Option<&'static GeneratedBlock> {
     GENERATED_BLOCKS.iter().find(|b| b.name == name)
 }
 
-fn find_generated_tag(name: &str) -> Option<&'static GeneratedBlockTag> {
-    GENERATED_BLOCK_TAGS.iter().find(|tag| tag.name == name)
+fn generated_block_tag_map() -> BTreeMap<String, Vec<String>> {
+    let mut tags = BTreeMap::new();
+    for tag in GENERATED_BLOCK_TAGS {
+        tags.insert(
+            normalize_tag(tag.name),
+            normalize_tag_blocks(tag.blocks.iter().copied().map(str::to_string).collect()),
+        );
+    }
+    tags
+}
+
+fn runtime_block_tags() -> &'static RwLock<BTreeMap<String, Vec<String>>> {
+    RUNTIME_BLOCK_TAGS.get_or_init(|| RwLock::new(generated_block_tag_map()))
+}
+
+fn merge_runtime_block_tags(
+    tags: &mut BTreeMap<String, Vec<String>>,
+    custom_tags: BTreeMap<String, Vec<String>>,
+) {
+    for (tag, blocks) in custom_tags {
+        tags.insert(normalize_tag(&tag), normalize_tag_blocks(blocks));
+    }
+}
+
+fn normalize_tag_blocks(blocks: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for block in blocks {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let block = normalize(split_key(block).0);
+        if !normalized.contains(&block) {
+            normalized.push(block);
+        }
+    }
+    normalized
 }
 
 fn normalize_tag(tag: &str) -> String {
@@ -358,6 +612,23 @@ fn normalize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_TAG_MUTATION: Mutex<()> = Mutex::new(());
+
+    fn with_test_runtime_tag<T>(tag: &str, blocks: &[&str], f: impl FnOnce() -> T) -> T {
+        let _guard = TEST_TAG_MUTATION.lock().unwrap();
+        let original = runtime_block_tags().read().unwrap().clone();
+        let mut merged = original.clone();
+        merged.insert(
+            normalize_tag(tag),
+            normalize_tag_blocks(blocks.iter().copied().map(str::to_string).collect()),
+        );
+        *runtime_block_tags().write().unwrap() = merged;
+        let result = f();
+        *runtime_block_tags().write().unwrap() = original;
+        result
+    }
 
     #[test]
     fn splits_properties() {
@@ -441,5 +712,15 @@ mod tests {
         assert!(oak_slab_states.iter().all(|id| slab_states.contains(id)));
         assert!(oak_slab_states.iter().any(|id| !slab_defaults.contains(id)));
         assert!(slab_states.len() > slab_defaults.len());
+    }
+
+    #[test]
+    fn runtime_block_tags_support_custom_tags() {
+        with_test_runtime_tag("custom:terrain_mix", &["stone", "minecraft:dirt"], || {
+            let states = state_ids_for_tag("custom:terrain_mix", false);
+            assert_eq!(states.len(), 2);
+            assert!(states.contains(&state_id_for("stone").unwrap()));
+            assert!(states.contains(&state_id_for("dirt").unwrap()));
+        });
     }
 }

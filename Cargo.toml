@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # This is the api crate that makes creating plugins easier, and has wit definitions.
 pumpkin-plugin-api = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-plugin-api" }
-pumpkin-data = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-data", default-features = false, features = ["block"] }
+pumpkin-data = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-data", default-features = false, features = ["block", "tag"] }
 tracing = "0.1.44"
 
 # Schematic loading.
@@ -17,6 +17,7 @@ tracing = "0.1.44"
 fastnbt = "2.6.1"
 flate2 = { version = "1.0.30", default-features = false, features = ["rust_backend"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 
 [build-dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

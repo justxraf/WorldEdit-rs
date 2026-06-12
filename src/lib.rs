@@ -18,6 +18,7 @@
 mod block_data;
 mod clipboard;
 mod commands;
+mod expression;
 mod history;
 mod mapping;
 mod mask;
@@ -26,6 +27,7 @@ mod schem_paste;
 mod schematic;
 mod selection;
 mod simplex_noise;
+mod snbt;
 mod transform;
 
 use pumpkin_plugin_api::{
@@ -65,6 +67,22 @@ impl Plugin for WorldEditPlugin {
                  Only a small set of blocks will map correctly. Drop Pumpkin's blocks.json \
                  into assets/ and rebuild for full support.",
             );
+        }
+
+        let data_folder = context.get_data_folder();
+        match mapping::load_runtime_block_tags(&data_folder) {
+            Ok(0) => {}
+            Ok(count) => logging::log(
+                LogLevel::Info,
+                &format!(
+                    "WorldEdit-rs: loaded {count} custom block tag(s) from \
+                     {data_folder}/block_tags.json."
+                ),
+            ),
+            Err(err) => logging::log(
+                LogLevel::Warn,
+                &format!("WorldEdit-rs: failed to load runtime block tags: {err}"),
+            ),
         }
 
         commands::register(&context);

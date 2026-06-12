@@ -25,7 +25,7 @@ use pumpkin_plugin_api::common::BlockPos;
 use crate::block_data::BlockPlacement;
 
 /// One undoable edit: for every changed block, its state before and after.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct EditChange {
     pub pos: BlockPos,
     pub before: BlockPlacement,

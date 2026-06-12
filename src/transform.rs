@@ -1,150 +1,151 @@
-//! Block position and state rotation/flip transformations.
+//! Block position and state rotation/flip transformations for clipboard
+//! `//rotate` and `//flip`.
 //!
-//! A `Transform` stores pending 90-degree rotations (Y/X/Z axes) and axis flips,
-//! composed lazily at paste time. Blocks' directional properties (facing, axis,
-//! rotation, etc.) are remapped according to the transform.
+//! A [`Transform`] is a signed permutation matrix: 90-degree-multiple
+//! rotations (any axis) and per-axis flips all compose into a single 3x3
+//! integer matrix with exactly one nonzero (+1 or -1) entry per row and
+//! column. Composition is matrix multiplication, so repeated
+//! `//rotate`/`//flip` calls combine exactly like FAWE's
+//! `AffineTransform::combine`, and is always exact (no resampling).
+//!
+//! Positions are transformed around the clipboard's origin point (the
+//! position recorded at `//copy` time, i.e. where `-o` pastes), not the
+//! bounding-box center: this keeps every transform exactly integer-valued
+//! and trivially composable, at the cost of the structure's footprint
+//! shifting relative to its origin if the original selection wasn't
+//! centered on the copy point. `//paste` recomputes its target bounding box
+//! from the transformed offsets, so the pasted structure is still placed
+//! correctly - only its position *relative to the origin point* changes.
 
 use crate::mapping;
 
-/// A pending rotation/flip to apply to the clipboard.
-///
-/// Stores 90-degree rotation angles (Y/X/Z) and axis flips. Transforms compose
-/// via `combine()`, matching FAWE's design. The identity is all zeros.
+const IDENTITY: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+/// 90° rotation around Y: (x, y, z) -> (-z, y, x). Matches WorldEdit's
+/// "positive angle = clockwise" convention (north -> east).
+const ROT_Y_90: [[i32; 3]; 3] = [[0, 0, -1], [0, 1, 0], [1, 0, 0]];
+/// 90° rotation around X: (x, y, z) -> (x, -z, y).
+const ROT_X_90: [[i32; 3]; 3] = [[1, 0, 0], [0, 0, -1], [0, 1, 0]];
+/// 90° rotation around Z: (x, y, z) -> (-y, x, z).
+const ROT_Z_90: [[i32; 3]; 3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]];
+
+/// A pending rotation/flip to apply to the clipboard, represented as a 3x3
+/// signed permutation matrix. The identity transform leaves positions and
+/// states unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transform {
-    /// Rotation around Y axis: 0, 1, 2, or 3 (representing 0°, 90°, 180°, 270°).
-    pub rot_y: u8,
-    /// Rotation around X axis: 0, 1, 2, or 3.
-    pub rot_x: u8,
-    /// Rotation around Z axis: 0, 1, 2, or 3.
-    pub rot_z: u8,
-    /// Flip along X axis: true = flipped.
-    pub flip_x: bool,
-    /// Flip along Y axis: true = flipped.
-    pub flip_y: bool,
-    /// Flip along Z axis: true = flipped.
-    pub flip_z: bool,
+    matrix: [[i32; 3]; 3],
 }
 
 impl Default for Transform {
     fn default() -> Self {
-        Self {
-            rot_y: 0,
-            rot_x: 0,
-            rot_z: 0,
-            flip_x: false,
-            flip_y: false,
-            flip_z: false,
-        }
+        Self { matrix: IDENTITY }
     }
 }
 
 impl Transform {
-    /// Create an identity transform (no change).
+    /// The identity transform (no change).
     pub fn identity() -> Self {
         Self::default()
     }
 
-    /// Create a pure Y-axis rotation.
+    /// A rotation around the Y (vertical) axis. `degrees` must be a multiple
+    /// of 90 (negative and >360 values are normalized); returns `None`
+    /// otherwise.
     pub fn rotate_y(degrees: i32) -> Option<Self> {
-        let rot = normalize_rotation(degrees)?;
-        Some(Self {
-            rot_y: rot,
-            ..Default::default()
-        })
+        Self::from_base(ROT_Y_90, degrees)
     }
 
-    /// Create a pure X-axis rotation.
+    /// A rotation around the X axis. `degrees` must be a multiple of 90.
     pub fn rotate_x(degrees: i32) -> Option<Self> {
-        let rot = normalize_rotation(degrees)?;
-        Some(Self {
-            rot_x: rot,
-            ..Default::default()
-        })
+        Self::from_base(ROT_X_90, degrees)
     }
 
-    /// Create a pure Z-axis rotation.
+    /// A rotation around the Z axis. `degrees` must be a multiple of 90.
     pub fn rotate_z(degrees: i32) -> Option<Self> {
-        let rot = normalize_rotation(degrees)?;
-        Some(Self {
-            rot_z: rot,
-            ..Default::default()
-        })
+        Self::from_base(ROT_Z_90, degrees)
     }
 
-    /// Create a pure X-axis flip.
+    fn from_base(base: [[i32; 3]; 3], degrees: i32) -> Option<Self> {
+        let steps = normalize_rotation(degrees)?;
+        let mut matrix = IDENTITY;
+        for _ in 0..steps {
+            matrix = mat_mul(base, matrix);
+        }
+        Some(Self { matrix })
+    }
+
+    /// Mirror across the X axis (negates X offsets).
     pub fn flip_axis_x() -> Self {
         Self {
-            flip_x: true,
-            ..Default::default()
+            matrix: [[-1, 0, 0], [0, 1, 0], [0, 0, 1]],
         }
     }
 
-    /// Create a pure Y-axis flip.
+    /// Mirror across the Y axis (negates Y offsets).
     pub fn flip_axis_y() -> Self {
         Self {
-            flip_y: true,
-            ..Default::default()
+            matrix: [[1, 0, 0], [0, -1, 0], [0, 0, 1]],
         }
     }
 
-    /// Create a pure Z-axis flip.
+    /// Mirror across the Z axis (negates Z offsets).
     pub fn flip_axis_z() -> Self {
         Self {
-            flip_z: true,
-            ..Default::default()
+            matrix: [[1, 0, 0], [0, 1, 0], [0, 0, -1]],
         }
     }
 
-    /// Compose two transforms: apply `other` after `self`.
+    /// Compose two transforms: the result applies `self` first, then `other`
+    /// to the result. This matches FAWE's `combine`, where repeated
+    /// `//rotate`/`//flip` calls accumulate onto the clipboard's pending
+    /// transform.
     pub fn combine(&self, other: Self) -> Self {
-        // Apply rotations in order, then flips.
-        // This is a simplified approach: we rotate the axes, then apply flips.
-        // For a full implementation, we'd need matrix algebra; this handles the common cases.
-
-        let (new_rot_y, new_rot_x, new_rot_z) = compose_rotations(
-            self.rot_y,
-            self.rot_x,
-            self.rot_z,
-            other.rot_y,
-            other.rot_x,
-            other.rot_z,
-        );
-
-        let (new_flip_x, new_flip_y, new_flip_z) = compose_flips(
-            self.flip_x,
-            self.flip_y,
-            self.flip_z,
-            other.flip_x,
-            other.flip_y,
-            other.flip_z,
-        );
-
         Self {
-            rot_y: new_rot_y,
-            rot_x: new_rot_x,
-            rot_z: new_rot_z,
-            flip_x: new_flip_x,
-            flip_y: new_flip_y,
-            flip_z: new_flip_z,
+            matrix: mat_mul(other.matrix, self.matrix),
         }
     }
 
-    /// Check if this is the identity transform.
+    /// `true` if this transform leaves positions and states unchanged.
     pub fn is_identity(&self) -> bool {
-        self.rot_y == 0
-            && self.rot_x == 0
-            && self.rot_z == 0
-            && !self.flip_x
-            && !self.flip_y
-            && !self.flip_z
+        self.matrix == IDENTITY
+    }
+
+    /// Apply this transform to an offset/position vector.
+    pub fn apply(&self, v: (i32, i32, i32)) -> (i32, i32, i32) {
+        let m = self.matrix;
+        (
+            m[0][0] * v.0 + m[0][1] * v.1 + m[0][2] * v.2,
+            m[1][0] * v.0 + m[1][1] * v.1 + m[1][2] * v.2,
+            m[2][0] * v.0 + m[2][1] * v.1 + m[2][2] * v.2,
+        )
+    }
+
+    /// Determinant of the transform matrix: `+1` for proper rotations, `-1`
+    /// for transforms that include an odd number of axis flips (mirrors
+    /// chirality-sensitive properties like door `hinge`).
+    fn determinant(&self) -> i32 {
+        let m = self.matrix;
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
     }
 }
 
-/// Normalize degrees to 0/90/180/270; return the rotation step (0/1/2/3) or None if invalid.
+/// `result = a * b` (matrix product, applied to a column vector as `a * (b * v)`).
+fn mat_mul(a: [[i32; 3]; 3], b: [[i32; 3]; 3]) -> [[i32; 3]; 3] {
+    let mut result = [[0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            result[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    result
+}
+
+/// Normalize degrees to a rotation step count (0/1/2/3 for 0/90/180/270°), or
+/// `None` if `degrees` isn't a multiple of 90.
 fn normalize_rotation(degrees: i32) -> Option<u8> {
-    let normalized = ((degrees % 360) + 360) % 360;
-    match normalized {
+    match ((degrees % 360) + 360) % 360 {
         0 => Some(0),
         90 => Some(1),
         180 => Some(2),
@@ -153,83 +154,12 @@ fn normalize_rotation(degrees: i32) -> Option<u8> {
     }
 }
 
-/// Apply two sequences of 90-degree rotations in order.
-/// Returns (rot_y, rot_x, rot_z) as the combined rotation.
-fn compose_rotations(y1: u8, x1: u8, z1: u8, y2: u8, x2: u8, z2: u8) -> (u8, u8, u8) {
-    // For now, apply Y first, then X, then Z, sequentially.
-    // This is a simplification; a full implementation would use matrix multiplication.
-    let (ry, rx, rz) = apply_rotation(y1, x1, z1);
-    apply_rotation(
-        ry.wrapping_add(y2) % 4,
-        rx.wrapping_add(x2) % 4,
-        rz.wrapping_add(z2) % 4,
-    )
-}
-
-/// Identity for this simplification: assume rotations are applied in order Y, X, Z.
-fn apply_rotation(y: u8, x: u8, z: u8) -> (u8, u8, u8) {
-    (y % 4, x % 4, z % 4)
-}
-
-/// Compose two flip sequences; each flip flips a bool, so the result is XOR.
-fn compose_flips(
-    fx1: bool,
-    fy1: bool,
-    fz1: bool,
-    fx2: bool,
-    fy2: bool,
-    fz2: bool,
-) -> (bool, bool, bool) {
-    (fx1 ^ fx2, fy1 ^ fy2, fz1 ^ fz2)
-}
-
-/// Rotate a position `(dx, dy, dz)` around the origin by the given transform.
-///
-/// Assumes the bounding box is centered at the origin. Used when transforming
-/// clipboard offsets at paste time.
-pub fn rotate_position(dx: i32, dy: i32, dz: i32, transform: Transform) -> (i32, i32, i32) {
-    let (mut x, mut y, mut z) = (dx, dy, dz);
-
-    // Apply Y rotations (around vertical axis).
-    for _ in 0..transform.rot_y {
-        let temp = x;
-        x = -z;
-        z = temp;
-    }
-
-    // Apply X rotations (around horizontal left-right axis).
-    for _ in 0..transform.rot_x {
-        let temp = y;
-        y = -z;
-        z = temp;
-    }
-
-    // Apply Z rotations (around front-back axis).
-    for _ in 0..transform.rot_z {
-        let temp = x;
-        x = -y;
-        y = temp;
-    }
-
-    // Apply flips.
-    if transform.flip_x {
-        x = -x;
-    }
-    if transform.flip_y {
-        y = -y;
-    }
-    if transform.flip_z {
-        z = -z;
-    }
-
-    (x, y, z)
-}
-
 /// Rotate/flip a block state id, remapping directional properties.
 ///
-/// Splits the state into name and properties, transforms the properties
-/// according to the transform, and re-resolves the state. Falls back to the
-/// original state if the transformed state doesn't exist.
+/// Splits the state into name and properties, transforms direction-valued
+/// properties (`facing`, `axis`, `rotation`, `orientation`, `hinge`, `half`,
+/// rail `shape`) according to the transform, and re-resolves the state. Falls
+/// back to the original state if the transformed combination doesn't exist.
 pub fn transform_state(state_id: u16, transform: Transform) -> u16 {
     if transform.is_identity() || state_id == 0 {
         return state_id;
@@ -239,20 +169,16 @@ pub fn transform_state(state_id: u16, transform: Transform) -> u16 {
     let (name, props) = split_key_local(&key);
 
     if props.is_empty() {
-        return state_id; // No properties to transform.
+        return state_id;
     }
 
-    let transformed_props = transform_properties(props, transform);
-    let candidate = if transformed_props.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}[{}]", name, transformed_props)
-    };
+    let transformed_props = transform_properties(props, &transform);
+    let candidate = format!("{name}[{transformed_props}]");
 
     mapping::state_id_for(&candidate).unwrap_or(state_id)
 }
 
-/// Split a palette key into name and property string.
+/// Split a palette key into name and property string (without brackets).
 fn split_key_local(key: &str) -> (&str, &str) {
     match key.split_once('[') {
         Some((name, rest)) => {
@@ -263,277 +189,203 @@ fn split_key_local(key: &str) -> (&str, &str) {
     }
 }
 
-/// Transform block-state properties according to a rotation/flip.
-///
-/// Maps directional properties like `facing`, `axis`, `rotation`, `shape`, etc.
-fn transform_properties(props: &str, transform: Transform) -> String {
-    let mut result = Vec::new();
+/// Transform a `k=v,k=v` property string according to `transform`.
+fn transform_properties(props: &str, transform: &Transform) -> String {
+    let mut result: Vec<String> = Vec::new();
 
     for prop in props.split(',') {
         let prop = prop.trim();
-        let (key, value) = match prop.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => continue,
+        let Some((key, value)) = prop.split_once('=') else {
+            continue;
         };
+        let key = key.trim();
+        let value = value.trim();
 
         let new_value = match key {
-            "facing" => transform_facing(value, transform),
-            "axis" => transform_axis(value, transform),
-            "rotation" => transform_rotation_prop(value, transform),
+            "facing" => transform_direction(value, transform).unwrap_or_else(|| value.to_string()),
+            "axis" => transform_axis(value, transform).unwrap_or_else(|| value.to_string()),
+            "rotation" => {
+                transform_rotation16(value, transform).unwrap_or_else(|| value.to_string())
+            }
             "orientation" => transform_orientation(value, transform),
             "hinge" => transform_hinge(value, transform),
+            "half" => transform_half(value, transform),
             "shape" => transform_rail_shape(value, transform),
-            "half" => {
-                // Vertical half (top/bottom) flips with Y.
-                if transform.flip_y {
-                    match value {
-                        "top" => "bottom",
-                        "bottom" => "top",
-                        _ => value,
-                    }
-                } else {
-                    value
-                }
-            }
-            _ => value,
+            _ => value.to_string(),
         };
 
-        result.push(format!("{}={}", key, new_value));
+        result.push(format!("{key}={new_value}"));
     }
 
     result.sort();
     result.join(",")
 }
 
-/// Transform a `facing` direction (north, south, east, west, up, down).
-fn transform_facing(facing: &str, transform: Transform) -> &'static str {
-    let mut dir = match facing {
-        "north" => Direction::North,
-        "south" => Direction::South,
-        "east" => Direction::East,
-        "west" => Direction::West,
-        "up" => Direction::Up,
-        "down" => Direction::Down,
-        _ => return facing,
-    };
-
-    // Apply Y rotations.
-    for _ in 0..transform.rot_y {
-        dir = dir.rotate_y();
+/// Convert a direction name to its unit vector.
+fn direction_to_vector(direction: &str) -> Option<(i32, i32, i32)> {
+    match direction {
+        "north" => Some((0, 0, -1)),
+        "south" => Some((0, 0, 1)),
+        "east" => Some((1, 0, 0)),
+        "west" => Some((-1, 0, 0)),
+        "up" => Some((0, 1, 0)),
+        "down" => Some((0, -1, 0)),
+        _ => None,
     }
-
-    // Apply flips (interpret as rotations around the respective axes).
-    if transform.flip_x {
-        dir = dir.flip_x();
-    }
-    if transform.flip_y {
-        dir = dir.flip_y();
-    }
-    if transform.flip_z {
-        dir = dir.flip_z();
-    }
-
-    dir.as_str()
 }
 
-/// Transform an `axis` property (x, y, z).
-fn transform_axis(axis: &str, transform: Transform) -> &'static str {
-    let mut ax = match axis {
-        "x" => Axis::X,
-        "y" => Axis::Y,
-        "z" => Axis::Z,
-        _ => return axis,
-    };
-
-    // Y rotations permute X and Z.
-    for _ in 0..transform.rot_y {
-        ax = match ax {
-            Axis::X => Axis::Z,
-            Axis::Z => Axis::X,
-            Axis::Y => Axis::Y,
-        };
+/// Convert a unit vector back to a direction name.
+fn vector_to_direction(v: (i32, i32, i32)) -> Option<&'static str> {
+    match v {
+        (0, 0, -1) => Some("north"),
+        (0, 0, 1) => Some("south"),
+        (1, 0, 0) => Some("east"),
+        (-1, 0, 0) => Some("west"),
+        (0, 1, 0) => Some("up"),
+        (0, -1, 0) => Some("down"),
+        _ => None,
     }
-
-    // X rotations permute Y and Z.
-    for _ in 0..transform.rot_x {
-        ax = match ax {
-            Axis::Y => Axis::Z,
-            Axis::Z => Axis::Y,
-            Axis::X => Axis::X,
-        };
-    }
-
-    // Z rotations permute X and Y.
-    for _ in 0..transform.rot_z {
-        ax = match ax {
-            Axis::X => Axis::Y,
-            Axis::Y => Axis::X,
-            Axis::Z => Axis::Z,
-        };
-    }
-
-    ax.as_str()
 }
 
-/// Transform a `rotation` property (used by item frames, banners, etc., 0-15).
-fn transform_rotation_prop(rotation: &str, transform: Transform) -> String {
-    let Ok(rot) = rotation.parse::<u16>() else {
-        return rotation.to_string();
-    };
-
-    // Only Y rotation affects this; convert to 0-3 scale, apply rotation, convert back.
-    let step = (rot + 1) / 4; // Roughly maps 0-15 to 0-3.
-    let new_step = (step + transform.rot_y as u16) % 4;
-    let new_rot = new_step * 4;
-    new_rot.to_string()
+/// Transform a 6-way direction property (`facing`, halves of `orientation`,
+/// `shape` endpoints). Returns `None` if `value` isn't a recognized
+/// direction or the transformed vector isn't (e.g. a 4-way `facing` rotated
+/// onto the vertical axis by an X/Z rotation, for a block that has no
+/// up/down state - the caller falls back to the original value).
+fn transform_direction(value: &str, transform: &Transform) -> Option<String> {
+    let vector = direction_to_vector(value)?;
+    let transformed = transform.apply(vector);
+    vector_to_direction(transformed).map(str::to_string)
 }
 
-/// Transform an `orientation` property (used by pointing blocks).
-fn transform_orientation(orientation: &str, transform: Transform) -> String {
-    // Orientation is a compound of facing direction; reuse facing logic.
-    if let Some((facing_part, _)) = orientation.split_once('_') {
-        let new_facing = transform_facing(facing_part, transform);
-        format!("{}_down", new_facing) // Simplified; full implementation would parse both parts.
+/// Transform an `axis` property (`x`, `y`, or `z`) - undirected, so only the
+/// axis the vector lands on matters, not its sign.
+fn transform_axis(value: &str, transform: &Transform) -> Option<String> {
+    let vector = match value {
+        "x" => (1, 0, 0),
+        "y" => (0, 1, 0),
+        "z" => (0, 0, 1),
+        _ => return None,
+    };
+    let (x, y, _z) = transform.apply(vector);
+    let axis = if x != 0 {
+        "x"
+    } else if y != 0 {
+        "y"
     } else {
-        orientation.to_string()
+        "z"
+    };
+    Some(axis.to_string())
+}
+
+/// Map a horizontal cardinal unit vector's `(x, z)` to the 16-step `rotation`
+/// property's value at the corresponding cardinal step (0/4/8/12).
+fn cardinal_angle(v: (i32, i32, i32)) -> Option<i32> {
+    match (v.0, v.2) {
+        (0, 1) => Some(0),  // south
+        (-1, 0) => Some(4), // west
+        (0, -1) => Some(8), // north
+        (1, 0) => Some(12), // east
+        _ => None,
     }
 }
 
-/// Transform a `hinge` property (left/right, for doors).
-fn transform_hinge(hinge: &str, transform: Transform) -> &'static str {
-    // Hinge flips with X-Z plane flips.
-    if transform.flip_x ^ transform.flip_z {
-        match hinge {
-            "left" => "right",
-            "right" => "left",
-            _ => hinge,
+/// Transform a 16-step `rotation` property (banners, signs, skulls), where
+/// each step is 22.5°. Only meaningful when the transform doesn't rotate the
+/// Y axis into the horizontal plane (i.e. pure Y rotation and/or flips);
+/// otherwise the value is left unchanged.
+fn transform_rotation16(value: &str, transform: &Transform) -> Option<String> {
+    let r: i32 = value.parse().ok()?;
+    if !(0..16).contains(&r) {
+        return None;
+    }
+
+    let m = transform.matrix;
+    if m[1][0] != 0 || m[1][2] != 0 {
+        return None;
+    }
+
+    let south_image = transform.apply((0, 0, 1));
+    let east_image = transform.apply((1, 0, 0));
+    let a0 = cardinal_angle(south_image)?;
+    let a12 = cardinal_angle(east_image)?;
+
+    let additive_prediction = (12 + a0).rem_euclid(16);
+    let new_r = if a12 == additive_prediction {
+        (r + a0).rem_euclid(16)
+    } else {
+        (a0 - r).rem_euclid(16)
+    };
+    Some(new_r.to_string())
+}
+
+/// Transform an `orientation` property (e.g. jigsaw blocks), formatted as
+/// `<facing>_<rotation>` where both halves are 6-way directions.
+fn transform_orientation(value: &str, transform: &Transform) -> String {
+    let Some((first, second)) = value.split_once('_') else {
+        return value.to_string();
+    };
+    let new_first = transform_direction(first, transform).unwrap_or_else(|| first.to_string());
+    let new_second = transform_direction(second, transform).unwrap_or_else(|| second.to_string());
+    format!("{new_first}_{new_second}")
+}
+
+/// Transform a door's `hinge` (`left`/`right`). Chirality-sensitive: swaps
+/// iff the transform includes an odd number of flips (determinant `-1`).
+fn transform_hinge(value: &str, transform: &Transform) -> String {
+    if transform.determinant() < 0 {
+        match value {
+            "left" => "right".to_string(),
+            "right" => "left".to_string(),
+            _ => value.to_string(),
         }
     } else {
-        hinge
+        value.to_string()
     }
 }
 
-/// Transform a rail `shape` property.
-fn transform_rail_shape(shape: &str, transform: Transform) -> &'static str {
-    use Direction as D;
+/// Transform a `half` property (`top`/`bottom`, used by stairs). Swaps iff
+/// the transform maps "up" to "down".
+fn transform_half(value: &str, transform: &Transform) -> String {
+    if transform.apply((0, 1, 0)) == (0, -1, 0) {
+        match value {
+            "top" => "bottom".to_string(),
+            "bottom" => "top".to_string(),
+            _ => value.to_string(),
+        }
+    } else {
+        value.to_string()
+    }
+}
 
-    let dir = match shape {
-        "north_south" => (D::North, D::South),
-        "east_west" => (D::East, D::West),
-        "ascending_north" => (D::North, D::Up),
-        "ascending_south" => (D::South, D::Up),
-        "ascending_east" => (D::East, D::Up),
-        "ascending_west" => (D::West, D::Up),
-        _ => return shape,
+/// Transform a rail `shape` (straight and ascending variants; curves are left
+/// unchanged).
+fn transform_rail_shape(value: &str, transform: &Transform) -> String {
+    let pair = match value {
+        "north_south" => ("north", "south"),
+        "east_west" => ("east", "west"),
+        "ascending_north" => ("north", "up"),
+        "ascending_south" => ("south", "up"),
+        "ascending_east" => ("east", "up"),
+        "ascending_west" => ("west", "up"),
+        _ => return value.to_string(),
     };
 
-    // Transform both directions.
-    let mut d1 = dir.0;
-    let mut d2 = dir.1;
+    let Some(d1) = transform_direction(pair.0, transform) else {
+        return value.to_string();
+    };
+    let Some(d2) = transform_direction(pair.1, transform) else {
+        return value.to_string();
+    };
 
-    for _ in 0..transform.rot_y {
-        d1 = d1.rotate_y();
-        d2 = d2.rotate_y();
-    }
-
-    if transform.flip_x {
-        d1 = d1.flip_x();
-        d2 = d2.flip_x();
-    }
-    if transform.flip_y {
-        d1 = d1.flip_y();
-        d2 = d2.flip_y();
-    }
-    if transform.flip_z {
-        d1 = d1.flip_z();
-        d2 = d2.flip_z();
-    }
-
-    // Reconstruct shape string.
-    match (d1, d2) {
-        (D::North, D::South) | (D::South, D::North) => "north_south",
-        (D::East, D::West) | (D::West, D::East) => "east_west",
-        (D::North, D::Up) | (D::Up, D::North) => "ascending_north",
-        (D::South, D::Up) | (D::Up, D::South) => "ascending_south",
-        (D::East, D::Up) | (D::Up, D::East) => "ascending_east",
-        (D::West, D::Up) | (D::Up, D::West) => "ascending_west",
-        _ => shape,
-    }
-}
-
-/// Cardinal and vertical directions.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Direction {
-    North,
-    South,
-    East,
-    West,
-    Up,
-    Down,
-}
-
-impl Direction {
-    fn as_str(self) -> &'static str {
-        match self {
-            Direction::North => "north",
-            Direction::South => "south",
-            Direction::East => "east",
-            Direction::West => "west",
-            Direction::Up => "up",
-            Direction::Down => "down",
-        }
-    }
-
-    fn rotate_y(self) -> Self {
-        match self {
-            Direction::North => Direction::East,
-            Direction::East => Direction::South,
-            Direction::South => Direction::West,
-            Direction::West => Direction::North,
-            _ => self,
-        }
-    }
-
-    fn flip_x(self) -> Self {
-        match self {
-            Direction::East => Direction::West,
-            Direction::West => Direction::East,
-            _ => self,
-        }
-    }
-
-    fn flip_y(self) -> Self {
-        match self {
-            Direction::Up => Direction::Down,
-            Direction::Down => Direction::Up,
-            _ => self,
-        }
-    }
-
-    fn flip_z(self) -> Self {
-        match self {
-            Direction::North => Direction::South,
-            Direction::South => Direction::North,
-            _ => self,
-        }
-    }
-}
-
-/// Block axes.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Axis {
-    X,
-    Y,
-    Z,
-}
-
-impl Axis {
-    fn as_str(self) -> &'static str {
-        match self {
-            Axis::X => "x",
-            Axis::Y => "y",
-            Axis::Z => "z",
-        }
+    match (d1.as_str(), d2.as_str()) {
+        ("north", "south") | ("south", "north") => "north_south".to_string(),
+        ("east", "west") | ("west", "east") => "east_west".to_string(),
+        ("north", "up") | ("up", "north") => "ascending_north".to_string(),
+        ("south", "up") | ("up", "south") => "ascending_south".to_string(),
+        ("east", "up") | ("up", "east") => "ascending_east".to_string(),
+        ("west", "up") | ("up", "west") => "ascending_west".to_string(),
+        _ => value.to_string(),
     }
 }
 
@@ -549,44 +401,148 @@ mod tests {
     #[test]
     fn four_y_rotations_equal_identity() {
         let rot = Transform::rotate_y(90).unwrap();
-        let four_rots = rot.combine(rot).combine(rot).combine(rot);
-        assert!(four_rots.is_identity());
+        let mut acc = Transform::identity();
+        for _ in 0..4 {
+            acc = acc.combine(rot);
+        }
+        assert!(acc.is_identity());
+    }
+
+    #[test]
+    fn four_x_rotations_equal_identity() {
+        let rot = Transform::rotate_x(90).unwrap();
+        let mut acc = Transform::identity();
+        for _ in 0..4 {
+            acc = acc.combine(rot);
+        }
+        assert!(acc.is_identity());
     }
 
     #[test]
     fn two_flips_equal_identity() {
         let flip = Transform::flip_axis_x();
-        let two_flips = flip.combine(flip);
-        assert!(two_flips.is_identity());
+        assert!(flip.combine(flip).is_identity());
     }
 
     #[test]
-    fn rotate_position_90_degrees_y() {
-        let (x, y, z) = rotate_position(1, 0, 0, Transform::rotate_y(90).unwrap());
-        assert_eq!((x, y, z), (0, 0, -1));
+    fn rotate_y_90_matches_worldedit_clockwise_convention() {
+        // north (0,0,-1) -> east (1,0,0)
+        let rot = Transform::rotate_y(90).unwrap();
+        assert_eq!(rot.apply((0, 0, -1)), (1, 0, 0));
+        assert_eq!(rot.apply((1, 0, 0)), (0, 0, 1)); // east -> south
     }
 
     #[test]
-    fn rotate_position_180_degrees_y() {
-        let (x, y, z) = rotate_position(1, 0, 0, Transform::rotate_y(180).unwrap());
-        assert_eq!((x, y, z), (-1, 0, 0));
+    fn rotate_y_180_negates_horizontal_offsets() {
+        let rot = Transform::rotate_y(180).unwrap();
+        assert_eq!(rot.apply((3, 5, -2)), (-3, 5, 2));
     }
 
     #[test]
-    fn facing_north_rotates_to_east() {
-        let facing = transform_facing("north", Transform::rotate_y(90).unwrap());
-        assert_eq!(facing, "east");
+    fn rejects_non_multiple_of_90() {
+        assert!(Transform::rotate_y(45).is_none());
+        assert!(Transform::rotate_y(91).is_none());
     }
 
     #[test]
-    fn axis_x_rotates_to_z_around_y() {
-        let axis = transform_axis("x", Transform::rotate_y(90).unwrap());
-        assert_eq!(axis, "z");
+    fn negative_and_large_angles_normalize() {
+        assert_eq!(Transform::rotate_y(-90), Transform::rotate_y(270));
+        assert_eq!(Transform::rotate_y(450), Transform::rotate_y(90));
     }
 
     #[test]
-    fn flip_x_reverses_east_west() {
-        let facing = transform_facing("east", Transform::flip_axis_x());
-        assert_eq!(facing, "west");
+    fn composing_two_90_y_rotations_equals_180() {
+        let rot90 = Transform::rotate_y(90).unwrap();
+        let rot180 = Transform::rotate_y(180).unwrap();
+        assert_eq!(rot90.combine(rot90), rot180);
+    }
+
+    #[test]
+    fn combine_applies_self_then_other() {
+        // rotate 90, then flip X: a point rotated to east(1,0,0) should then be
+        // mirrored to west(-1,0,0).
+        let rot = Transform::rotate_y(90).unwrap();
+        let flip = Transform::flip_axis_x();
+        let combined = rot.combine(flip);
+        assert_eq!(combined.apply((0, 0, -1)), (-1, 0, 0)); // north -> east -> west
+    }
+
+    #[test]
+    fn oak_stairs_facing_north_rotates_to_east() {
+        let stone_brick_stairs_north = mapping::state_id_for(
+            "minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]",
+        );
+        let Some(state) = stone_brick_stairs_north else {
+            // Full registry not embedded in this build; skip.
+            return;
+        };
+        let rot = Transform::rotate_y(90).unwrap();
+        let transformed = transform_state(state, rot);
+        let key = mapping::palette_key_for_state_id(transformed);
+        assert!(key.contains("facing=east"), "expected facing=east in {key}");
+    }
+
+    #[test]
+    fn flip_x_mirrors_east_west_facing() {
+        let new_value = transform_direction("east", &Transform::flip_axis_x());
+        assert_eq!(new_value, Some("west".to_string()));
+        let unchanged = transform_direction("north", &Transform::flip_axis_x());
+        assert_eq!(unchanged, Some("north".to_string()));
+    }
+
+    #[test]
+    fn axis_rotates_with_y_rotation() {
+        let rot = Transform::rotate_y(90).unwrap();
+        assert_eq!(transform_axis("x", &rot), Some("z".to_string()));
+        assert_eq!(transform_axis("z", &rot), Some("x".to_string()));
+        assert_eq!(transform_axis("y", &rot), Some("y".to_string()));
+    }
+
+    #[test]
+    fn hinge_swaps_on_flip_but_not_rotation() {
+        let rot = Transform::rotate_y(90).unwrap();
+        let flip = Transform::flip_axis_x();
+        assert_eq!(transform_hinge("left", &rot), "left");
+        assert_eq!(transform_hinge("left", &flip), "right");
+    }
+
+    #[test]
+    fn half_swaps_on_y_flip_but_not_y_rotation() {
+        let rot = Transform::rotate_y(90).unwrap();
+        let flip_y = Transform::flip_axis_y();
+        assert_eq!(transform_half("top", &rot), "top");
+        assert_eq!(transform_half("top", &flip_y), "bottom");
+    }
+
+    #[test]
+    fn rail_shape_ascending_rotates() {
+        let rot = Transform::rotate_y(90).unwrap();
+        assert_eq!(
+            transform_rail_shape("ascending_north", &rot),
+            "ascending_east"
+        );
+        assert_eq!(transform_rail_shape("north_south", &rot), "east_west");
+    }
+
+    #[test]
+    fn rail_shape_ascending_flips_with_axis_mirror() {
+        let flip_z = Transform::flip_axis_z();
+        assert_eq!(
+            transform_rail_shape("ascending_north", &flip_z),
+            "ascending_south"
+        );
+    }
+
+    #[test]
+    fn rotation16_rotates_with_y_rotation() {
+        let rot = Transform::rotate_y(90).unwrap();
+        assert_eq!(transform_rotation16("0", &rot), Some("4".to_string()));
+        assert_eq!(transform_rotation16("12", &rot), Some("0".to_string()));
+    }
+
+    #[test]
+    fn rotation16_unaffected_by_x_rotation_into_vertical() {
+        let rot_x = Transform::rotate_x(90).unwrap();
+        assert_eq!(transform_rotation16("0", &rot_x), None);
     }
 }

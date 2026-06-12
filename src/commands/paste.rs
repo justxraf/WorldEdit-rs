@@ -17,9 +17,9 @@ use pumpkin_plugin_api::{
     world::BlockChange,
 };
 
-use crate::{clipboard, history, history::EditEntry, mapping, selection, transform};
+use crate::{clipboard, history, history::EditEntry, mapping, selection};
 
-use super::{batch_size, block_flags, command_names, player_key, sender_block_pos};
+use super::{batch_size, block_flags, command_names, passes_gmask, player_key, sender_block_pos};
 
 pub fn register(context: &Context) {
     let flags_arg = CommandNode::argument("flags", &ArgumentType::String(StringType::Greedy))
@@ -111,12 +111,13 @@ impl pumpkin_plugin_api::commands::CommandHandler for PasteCommand {
             return Ok(0);
         };
 
-        let Some(buffer) = clipboard::get(&key) else {
+        let Some((buffer, transform)) = clipboard::get_with_transform(&key) else {
             sender.send_error(TextComponent::text(
                 "Your clipboard is empty. Use //copy first.",
             ));
             return Ok(0);
         };
+        let buffer = buffer.transformed(transform);
         let flags = match flags_from_args(&args) {
             Ok(flags) => flags,
             Err(message) => {
@@ -168,10 +169,13 @@ impl pumpkin_plugin_api::commands::CommandHandler for PasteCommand {
                     z: paste_origin.z + offset.2,
                 };
                 let before = world.get_block_state_id(target);
+                if !passes_gmask(&key, before) {
+                    continue;
+                }
                 if before == state {
                     continue;
                 }
-                entry.changes.push((target, before, state));
+                entry.push_state_change(target, before, state);
                 changes.push(BlockChange { pos: target, state });
             }
             placed += changes.len();

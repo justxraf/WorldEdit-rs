@@ -2,27 +2,31 @@
 
 ## Patterns
 
-- [ ] `#color <r> <g> <b>`
-- [ ] `#saturate <r> <g> <b> <a>`
-- [ ] `#darken`
+- [x] `#color <r> <g> <b>`
+- [x] `#saturate <r> <g> <b> <a>`
+- [x] `#darken`
 - [ ] `#anglecolor <distance>`
-- [ ] `#desaturate <percent>`
-- [ ] `#averagecolor <r> <g> <b> <a>`
-- [ ] `#lighten`
+- [x] `#desaturate <percent>`
+- [x] `#averagecolor <r> <g> <b> <a>`
+- [x] `#lighten`
 
 ## Why It Is Missing
 
-These patterns need a palette that maps blocks to representative colors. Some
-also depend on the existing block, opacity/material behavior, or terrain angle.
+The non-angle variants now use a bundled palette derived from Pumpkin's
+`blocks.json` `map_color` metadata, with FAWE-style color transforms applied to
+the existing block. `#anglecolor` is still blocked on terrain-angle sampling.
+
+This is intentionally an approximation of FAWE's texture-based matcher: it is
+deterministic and fast, but it does not yet read client textures or biome-tinted
+grass colors.
 
 ## Implementation Notes
 
-- [ ] Choose a block color source: bundled palette, generated assets, or Pumpkin
+- [x] Choose a block color source: bundled palette, generated assets, or Pumpkin
       registry data.
-- [ ] Implement nearest-color block lookup.
-- [ ] Decide which block states are eligible for color replacement.
-- [ ] Implement color transforms against the existing block color.
+- [x] Implement nearest-color block lookup.
+- [x] Decide which block states are eligible for color replacement.
+- [x] Implement color transforms against the existing block color.
 - [ ] Add terrain-angle sampling for `#anglecolor`.
-- [ ] Add tests for deterministic color matching and unsupported/transparent
+- [x] Add tests for deterministic color matching and unsupported/transparent
       blocks.
-

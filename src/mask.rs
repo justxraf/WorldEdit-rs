@@ -32,10 +32,7 @@ pub fn clear(key: &str) {
 /// `true` if `state_id` passes the player's global mask, or if no global
 /// mask is set.
 pub fn passes(key: &str, state_id: u16) -> bool {
-    GLOBAL_MASKS.with_borrow(|map| {
-        map.get(key)
-            .is_none_or(|mask| mask.matches(state_id))
-    })
+    GLOBAL_MASKS.with_borrow(|map| map.get(key).is_none_or(|mask| mask.matches(state_id)))
 }
 
 #[cfg(test)]

@@ -10,16 +10,18 @@ use pumpkin_plugin_api::{
     command_wit::{Arg, ArgumentType, StringType},
     logging::{self, LogLevel},
     text::TextComponent,
-    world::BlockChange,
 };
 
 use crate::{
+    block_data::{self, BlockPlacement},
     clipboard, history,
     history::EditEntry,
     pattern::{BlockPattern, PatternEvalContext},
 };
 
-use super::{batch_size, block_flags, command_names, require_selection, sender_block_pos};
+use super::{
+    batch_size, block_flags, command_names, passes_gmask, require_selection, sender_block_pos,
+};
 
 const AIR_STATE_ID: u16 = 0;
 
@@ -57,7 +59,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
             },
             _ => BlockPattern::Literal {
                 input: "minecraft:air".to_string(),
-                state_id: AIR_STATE_ID,
+                placement: BlockPlacement::new(AIR_STATE_ID),
             },
         };
         let leave_name = leave_pattern.description().to_string();
@@ -66,7 +68,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         let buffer = clipboard::capture(&world, &region, origin);
         let copied = buffer.blocks.len();
         clipboard::set(&key, buffer);
-        let pattern_ctx = PatternEvalContext::for_player(region.min, &key);
+        let pattern_ctx = PatternEvalContext::for_operation(region.min, &key, &world);
         if let Err(message) = leave_pattern.validate(&pattern_ctx) {
             sender.send_error(TextComponent::text(&message));
             return Ok(0);
@@ -75,22 +77,22 @@ impl pumpkin_plugin_api::commands::CommandHandler for CutCommand {
         let mut cleared = 0usize;
         let mut entry = EditEntry::default();
         region.for_each_batch(batch_size(), |batch| {
-            let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
+            let mut changes = Vec::with_capacity(batch.len());
             for &pos in batch {
-                let before = world.get_block_state_id(pos);
-                let leave_state = leave_pattern.state_at_with(pos, before, &pattern_ctx);
-                if before == leave_state {
+                let before = block_data::capture_block(&world, pos);
+                if !passes_gmask(&key, before.state_id) {
                     continue;
                 }
-                entry.changes.push((pos, before, leave_state));
-                changes.push(BlockChange {
-                    pos,
-                    state: leave_state,
-                });
+                let after = leave_pattern.placement_at_with(pos, &before, &pattern_ctx);
+                if before == after {
+                    continue;
+                }
+                entry.push_change(pos, before, after.clone());
+                changes.push((pos, after));
             }
             cleared += changes.len();
             if !changes.is_empty() {
-                world.set_block_states(&changes, block_flags());
+                block_data::apply_blocks(&world, &changes, block_flags());
             }
         });
         history::push(&key, entry);

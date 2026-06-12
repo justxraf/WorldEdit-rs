@@ -42,6 +42,37 @@ impl ClipboardBuffer {
         self.target_region(self.origin, include_air)
     }
 
+    /// Apply `transform` to every block's offset and state, returning a new
+    /// buffer. Offsets are rotated/mirrored around `origin` (this buffer's
+    /// anchor point - see [`crate::transform`] for why). Returns a clone of
+    /// `self` unchanged if `transform` is the identity.
+    ///
+    /// `//paste` calls this before reading [`Self::target_region`] /
+    /// [`Self::blocks`], so the pasted bounding box and block states reflect
+    /// the clipboard's pending `//rotate`/`//flip` transform. `//copy` and
+    /// `//schematic save` continue to use the untransformed buffer from
+    /// [`get`], matching FAWE (the transform lives on the clipboard holder,
+    /// not the content).
+    pub fn transformed(&self, transform: Transform) -> ClipboardBuffer {
+        if transform.is_identity() {
+            return self.clone();
+        }
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|&(offset, state)| {
+                (
+                    transform.apply(offset),
+                    crate::transform::transform_state(state, transform),
+                )
+            })
+            .collect();
+        ClipboardBuffer {
+            origin: self.origin,
+            blocks,
+        }
+    }
+
     pub fn target_region(&self, paste_origin: BlockPos, include_air: bool) -> Option<Region> {
         let mut min: Option<BlockPos> = None;
         let mut max: Option<BlockPos> = None;
@@ -211,7 +242,7 @@ pub fn get_with_transform(key: &str) -> Option<(ClipboardBuffer, Transform)> {
 /// Update the transform for `key`'s clipboard, combining with any existing transform.
 pub fn set_transform(key: &str, new_transform: Transform) {
     CLIPBOARDS.with_borrow_mut(|map| {
-        if let Some((buffer, transform)) = map.get_mut(key) {
+        if let Some((_buffer, transform)) = map.get_mut(key) {
             *transform = transform.combine(new_transform);
         }
     });
@@ -228,6 +259,36 @@ mod tests {
 
     fn at(x: i32, y: i32, z: i32) -> BlockPos {
         BlockPos { x, y, z }
+    }
+
+    #[test]
+    fn transformed_identity_clones_unchanged() {
+        let buffer = ClipboardBuffer {
+            origin: at(10, 20, 30),
+            blocks: vec![((1, 0, 0), 1), ((0, 0, 2), 2)],
+        };
+        let out = buffer.transformed(crate::transform::Transform::identity());
+        assert_eq!(out.blocks, buffer.blocks);
+        assert_eq!((out.origin.x, out.origin.y, out.origin.z), (10, 20, 30));
+    }
+
+    #[test]
+    fn transformed_rotates_offsets_around_origin() {
+        use crate::transform::Transform;
+
+        let buffer = ClipboardBuffer {
+            origin: at(0, 0, 0),
+            blocks: vec![((1, 0, 0), 1), ((0, 0, -1), 2)],
+        };
+        let rotated = buffer.transformed(Transform::rotate_y(90).unwrap());
+        // east (1,0,0) -> south (0,0,1); north (0,0,-1) -> east (1,0,0).
+        assert_eq!(rotated.blocks[0].0, (0, 0, 1));
+        assert_eq!(rotated.blocks[1].0, (1, 0, 0));
+        // Origin (the paste anchor) is unchanged.
+        assert_eq!(
+            (rotated.origin.x, rotated.origin.y, rotated.origin.z),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -316,7 +377,7 @@ mod tests {
         set_transform(key, Transform::rotate_y(90).unwrap());
         set_transform(key, Transform::rotate_y(90).unwrap());
         let (_, transform) = get_with_transform(key).unwrap();
-        assert_eq!(transform.rot_y, 2); // Two 90° rotations = 180°
+        assert_eq!(transform, Transform::rotate_y(180).unwrap()); // Two 90° rotations = 180°
     }
 
     #[test]

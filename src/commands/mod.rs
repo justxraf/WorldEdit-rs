@@ -18,11 +18,13 @@ mod clearhistory;
 mod copy;
 mod count;
 mod cut;
+mod flip;
 mod gmask;
 mod paste;
 mod pos;
 mod redo;
 mod replace;
+mod rotate;
 mod schematic;
 mod sel;
 mod set;
@@ -133,6 +135,14 @@ pub fn register(context: &Context) {
             "Allows pasting the clipboard with //paste.",
         ),
         (
+            "worldedit.clipboard.rotate",
+            "Allows rotating the clipboard with //rotate.",
+        ),
+        (
+            "worldedit.clipboard.flip",
+            "Allows flipping the clipboard with //flip.",
+        ),
+        (
             "worldedit.history.undo",
             "Allows undoing your last edit with //undo.",
         ),
@@ -230,6 +240,8 @@ pub fn register(context: &Context) {
     copy::register(context);
     cut::register(context);
     paste::register(context);
+    rotate::register(context);
+    flip::register(context);
     undo::register(context);
     redo::register(context);
     size::register(context);
@@ -246,9 +258,9 @@ pub fn register(context: &Context) {
     logging::log(
         LogLevel::Info,
         "WorldEdit-rs: //pos1, //pos2, //hpos1, //hpos2, //sel, //set, //replace, //copy, //cut, \
-         //paste, //undo, //redo, //size, //clearclipboard, //clearhistory, //expand, //contract, \
-         //shift, //outset, //inset, //count, //walls, //faces, //outline, //wand, //schematic \
-         (//schem), //brush (//br), //gmask registered.",
+         //paste, //rotate, //flip, //undo, //redo, //size, //clearclipboard, //clearhistory, \
+         //expand, //contract, //shift, //outset, //inset, //count, //walls, //faces, //outline, \
+         //wand, //schematic (//schem), //brush (//br), //gmask registered.",
     );
 }
 

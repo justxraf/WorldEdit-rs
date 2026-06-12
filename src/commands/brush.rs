@@ -19,17 +19,20 @@ use pumpkin_plugin_api::{
     logging::{self, LogLevel},
     player::{Hand, Player},
     text::TextComponent,
-    world::{BlockChange, World},
+    world::World,
 };
 
 use crate::{
+    block_data::{self, BlockPlacement},
     clipboard,
     history::{self, EditEntry},
     mapping,
     pattern::{BlockMask, BlockPattern, PatternEvalContext},
 };
 
-use super::{batch_size, block_flags, permission_node, player_key, require_permission};
+use super::{
+    batch_size, block_flags, passes_gmask, permission_node, player_key, require_permission,
+};
 
 const MAX_RADIUS: f64 = 64.0;
 const MAX_HEIGHT: i32 = 256;
@@ -1080,7 +1083,7 @@ fn apply_brush(
     target: BlockPos,
     binding: &BrushBinding,
 ) -> Result<usize, String> {
-    let pattern_ctx = PatternEvalContext::for_player(target, key);
+    let pattern_ctx = PatternEvalContext::for_operation(target, key, world);
     match &binding.kind {
         BrushKind::Sphere {
             pattern,
@@ -1237,20 +1240,22 @@ fn apply_pattern_positions(
     for batch in positions.chunks(batch_size()) {
         let mut changes = Vec::with_capacity(batch.len());
         for &pos in batch {
-            let before = world.get_block_state_id(pos);
-            if mask.is_some_and(|mask| !mask.matches(before)) {
+            let before = block_data::capture_block(world, pos);
+            if mask.is_some_and(|mask| !mask.matches(before.state_id))
+                || !passes_gmask(key, before.state_id)
+            {
                 continue;
             }
-            let after = pattern.state_at_with(pos, before, pattern_ctx);
+            let after = pattern.placement_at_with(pos, &before, pattern_ctx);
             if before == after {
                 continue;
             }
-            entry.changes.push((pos, before, after));
-            changes.push(BlockChange { pos, state: after });
+            entry.push_change(pos, before, after.clone());
+            changes.push((pos, after));
         }
         changed += changes.len();
         if !changes.is_empty() {
-            world.set_block_states(&changes, block_flags());
+            block_data::apply_blocks(world, &changes, block_flags());
         }
     }
     history::push(key, entry);
@@ -1299,15 +1304,18 @@ fn apply_clipboard(
                 z: paste_origin.z + offset.2,
             };
             let before = world.get_block_state_id(pos);
-            if mask.is_some_and(|mask| !mask.matches(before)) || before == state {
+            if mask.is_some_and(|mask| !mask.matches(before))
+                || !passes_gmask(key, before)
+                || before == state
+            {
                 continue;
             }
-            entry.changes.push((pos, before, state));
-            changes.push(BlockChange { pos, state });
+            entry.push_state_change(pos, before, state);
+            changes.push((pos, BlockPlacement::new(state)));
         }
         changed += changes.len();
         if !changes.is_empty() {
-            world.set_block_states(&changes, block_flags());
+            block_data::apply_blocks(world, &changes, block_flags());
         }
     }
     history::push(key, entry);
@@ -1379,11 +1387,18 @@ fn apply_smooth(
         };
         if new_y > old_y {
             for y in old_y + 1..=new_y.min(MAX_BUILD_Y) {
-                push_change(world, &mut entry, BlockPos { x, y, z }, top_state, mask);
+                push_change(
+                    key,
+                    world,
+                    &mut entry,
+                    BlockPos { x, y, z },
+                    top_state,
+                    mask,
+                );
             }
         } else if new_y < old_y {
             for y in (new_y.max(MIN_BUILD_Y) + 1)..=old_y {
-                push_change(world, &mut entry, BlockPos { x, y, z }, 0, mask);
+                push_change(key, world, &mut entry, BlockPos { x, y, z }, 0, mask);
             }
         }
     }
@@ -1417,7 +1432,7 @@ fn apply_gravity(
             }
             for (i, y) in (min_y..=max_y).enumerate() {
                 let after = solids.get(i).copied().unwrap_or(0);
-                push_change(world, &mut entry, BlockPos { x, y, z }, after, None);
+                push_change(key, world, &mut entry, BlockPos { x, y, z }, after, None);
             }
         }
     }
@@ -1439,7 +1454,7 @@ fn apply_extinguish(
         if (Some(before) == fire || Some(before) == soul_fire)
             && mask.is_none_or(|mask| mask.matches(before))
         {
-            push_change(world, &mut entry, pos, 0, None);
+            push_change(key, world, &mut entry, pos, 0, None);
         }
     }
     commit_entry(key, world, entry)
@@ -1465,9 +1480,10 @@ fn apply_raise_lower(
             continue;
         }
         if lower {
-            push_change(world, &mut entry, BlockPos { x, y: top_y, z }, 0, None);
+            push_change(key, world, &mut entry, BlockPos { x, y: top_y, z }, 0, None);
         } else if top_y < MAX_BUILD_Y {
             push_change(
+                key,
                 world,
                 &mut entry,
                 BlockPos { x, y: top_y + 1, z },
@@ -1532,7 +1548,7 @@ fn apply_morph(
     let mut entry = EditEntry::default();
     for pos in positions {
         if let Some(after) = states.get(&pos.into()).copied() {
-            push_change(world, &mut entry, pos, after, None);
+            push_change(key, world, &mut entry, pos, after, None);
         }
     }
     commit_entry(key, world, entry)
@@ -1566,13 +1582,14 @@ fn apply_snow(
             top_y + 1
         };
         if y <= MAX_BUILD_Y {
-            push_change(world, &mut entry, BlockPos { x, y, z }, snow, None);
+            push_change(key, world, &mut entry, BlockPos { x, y, z }, snow, None);
         }
     }
     commit_entry(key, world, entry)
 }
 
 fn push_change(
+    key: &str,
     world: &World,
     entry: &mut EditEntry,
     pos: BlockPos,
@@ -1580,23 +1597,23 @@ fn push_change(
     mask: Option<&BlockMask>,
 ) {
     let before = world.get_block_state_id(pos);
-    if mask.is_some_and(|mask| !mask.matches(before)) || before == after {
+    if mask.is_some_and(|mask| !mask.matches(before))
+        || !passes_gmask(key, before)
+        || before == after
+    {
         return;
     }
-    entry.changes.push((pos, before, after));
+    entry.push_state_change(pos, before, after);
 }
 
 fn commit_entry(key: &str, world: &World, entry: EditEntry) -> usize {
     let changed = entry.changes.len();
     for batch in entry.changes.chunks(batch_size()) {
-        let changes: Vec<BlockChange> = batch
+        let changes: Vec<_> = batch
             .iter()
-            .map(|(pos, _, after)| BlockChange {
-                pos: *pos,
-                state: *after,
-            })
+            .map(|change| (change.pos, change.after.clone()))
             .collect();
-        world.set_block_states(&changes, block_flags());
+        block_data::apply_blocks(world, &changes, block_flags());
     }
     history::push(key, entry);
     changed
