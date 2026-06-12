@@ -89,8 +89,10 @@ static FALLBACK: &[(&str, u16)] = &[
 
 /// Resolve a palette key like `"minecraft:oak_log[axis=x]"` to a state id.
 ///
-/// Returns `None` if the block name is unknown. An unknown property combination
-/// degrades to the block's default state rather than failing.
+/// Returns `None` if the block name is unknown. A partial property list takes
+/// the default state's value for every unnamed property (WorldEdit semantics);
+/// an unknown property name or value degrades to the block's default state
+/// rather than failing.
 pub fn state_id_for(palette_key: &str) -> Option<u16> {
     let (name, props) = split_key(palette_key);
     let name = normalize(name);
@@ -101,13 +103,52 @@ pub fn state_id_for(palette_key: &str) -> Option<u16> {
             if let Some((_, id)) = block.variants.iter().find(|(k, _)| *k == wanted) {
                 return Some(*id);
             }
+            if let Some(id) = merge_with_default_props(block, &props) {
+                return Some(id);
+            }
         }
-        // No properties, no variant data, or no exact match: use the default.
+        // No properties, no variant data, or no usable match: use the default.
         return Some(block.default_id);
     }
 
     // Fallback table is name-only (ignores properties).
     FALLBACK.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
+}
+
+/// Overlay `props` onto `block`'s default-state property string and look the
+/// merged combination up in `block.variants`, so a partial key like
+/// `oak_sign[rotation=12]` resolves with default values for the properties it
+/// doesn't name. `None` when the default state has no variant entry or the
+/// merged combination doesn't exist (misspelled property name or value).
+fn merge_with_default_props(block: &GeneratedBlock, props: &[&str]) -> Option<u16> {
+    let (default_props, _) = block
+        .variants
+        .iter()
+        .find(|&&(_, id)| id == block.default_id)?;
+    // BTreeMap iterates keys sorted, so the merged string is canonical.
+    let mut merged: BTreeMap<&str, &str> = default_props
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .collect();
+    for kv in props {
+        let (key, value) = kv.split_once('=')?;
+        let key = key.trim();
+        // A property the block doesn't have can never form a valid variant.
+        if !merged.contains_key(key) {
+            return None;
+        }
+        merged.insert(key, value.trim());
+    }
+    let merged_key = merged
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    block
+        .variants
+        .iter()
+        .find(|(k, _)| *k == merged_key)
+        .map(|&(_, id)| id)
 }
 
 /// Highest global state id we know about. Used to bounds-check raw numeric
@@ -694,6 +735,51 @@ mod tests {
         assert_eq!(
             state_id_for(&palette_key_for_state_id(stone_id)),
             Some(stone_id)
+        );
+    }
+
+    #[test]
+    fn door_states_round_trip_through_palette_keys() {
+        let default = state_id_for("minecraft:oak_door").unwrap();
+        // Pumpkin's default oak door state, spelled out as properties.
+        assert_eq!(
+            state_id_for(
+                "minecraft:oak_door[facing=north,half=lower,hinge=left,open=false,powered=false]"
+            ),
+            Some(default)
+        );
+
+        // A non-default state (the upper half) must resolve to its own state
+        // id, not collapse to the default, and must reverse-map to a real
+        // palette key rather than air.
+        let upper = state_id_for(
+            "minecraft:oak_door[facing=east,half=upper,hinge=left,open=false,powered=false]",
+        )
+        .unwrap();
+        assert_ne!(upper, default);
+        let key = palette_key_for_state_id(upper);
+        assert!(key.starts_with("minecraft:oak_door["), "got {key}");
+        assert_eq!(state_id_for(&key), Some(upper));
+    }
+
+    #[test]
+    fn partial_properties_merge_onto_the_default_state() {
+        // Door default: facing=north,half=lower,hinge=left,open=false,powered=false.
+        let full = state_id_for(
+            "minecraft:oak_door[facing=east,half=lower,hinge=left,open=false,powered=false]",
+        )
+        .unwrap();
+        assert_eq!(state_id_for("minecraft:oak_door[facing=east]"), Some(full));
+
+        // Unknown property names / values still degrade to the default state.
+        let default = state_id_for("minecraft:oak_door").unwrap();
+        assert_eq!(
+            state_id_for("minecraft:oak_door[no_such_prop=yes]"),
+            Some(default)
+        );
+        assert_eq!(
+            state_id_for("minecraft:oak_door[facing=upside_down]"),
+            Some(default)
         );
     }
 

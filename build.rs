@@ -32,8 +32,43 @@ struct RawBlock {
     map_color: u8,
     #[serde(default)]
     default_state_id: u16,
+    /// Pumpkin-style dumps: hash keys into the `properties.json` registry, in
+    /// declaration order. Empty for blocks with a single state and in
+    /// mojang-report dumps (which carry properties per state instead).
+    #[serde(default)]
+    properties: Vec<i32>,
     #[serde(default)]
     states: Vec<RawState>,
+}
+
+/// One entry of Pumpkin's `properties.json` registry.
+#[derive(Deserialize)]
+struct RawProperty {
+    hash_key: i32,
+    serialized_name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    values: Vec<String>,
+    #[serde(default)]
+    min: i32,
+    #[serde(default)]
+    max: i32,
+}
+
+impl RawProperty {
+    /// Every value this property can take, in Pumpkin's state-enumeration
+    /// order. Booleans iterate `true` then `false` (matching vanilla and
+    /// pumpkin-codegen); enums use the registry's `values` order; ints run
+    /// `min..=max`. `None` for an unrecognised property type.
+    fn value_list(&self) -> Option<Vec<String>> {
+        match self.kind.as_str() {
+            "boolean" => Some(vec!["true".to_string(), "false".to_string()]),
+            "enum" => Some(self.values.clone()),
+            "int" => Some((self.min..=self.max).map(|v| v.to_string()).collect()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -83,9 +118,11 @@ struct ColorEntry {
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/blocks.json");
+    println!("cargo:rerun-if-changed=assets/properties.json");
     println!("cargo:rerun-if-changed=assets/block_tags.json");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../pumpkin/Pumpkin/assets/tags/26_1_tags.json");
+    println!("cargo:rerun-if-changed=../pumpkin/Pumpkin/assets/properties.json");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let block_map_dest = Path::new(&out_dir).join("block_map.rs");
@@ -93,9 +130,10 @@ fn main() {
 
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/blocks.json");
     let tag_assets = candidate_tag_assets();
+    let properties = load_property_registry();
 
     let generated_blocks = match fs::read_to_string(&assets) {
-        Ok(text) => match generate_from_json(&text) {
+        Ok(text) => match generate_from_json(&text, &properties) {
             Ok(code) => code,
             Err(e) => {
                 println!(
@@ -136,6 +174,108 @@ fn main() {
 
     fs::write(&block_map_dest, generated_blocks).expect("failed to write block_map.rs");
     fs::write(&block_tag_dest, generated_tags).expect("failed to write block_tags.rs");
+}
+
+/// Load Pumpkin's `properties.json` (the registry that block `properties`
+/// hash keys point into), keyed by hash. An empty map disables per-state
+/// property reconstruction, which degrades schematic save/load to
+/// default-state-only (doors, stairs orientation, etc. stop round-tripping),
+/// so warn loudly rather than silently.
+fn load_property_registry() -> BTreeMap<i32, RawProperty> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let local = manifest_dir.join("assets/properties.json");
+    let path = if local.exists() {
+        local
+    } else {
+        manifest_dir.join("../pumpkin/Pumpkin/assets/properties.json")
+    };
+
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            println!(
+                "cargo:warning=islands: properties.json not found; block-state variants will be \
+                 empty and property-carrying blocks (doors, stairs, ...) will not survive \
+                 schematic save/load. Drop Pumpkin's properties.json at assets/properties.json \
+                 or keep Pumpkin checked out at ../pumpkin/Pumpkin."
+            );
+            return BTreeMap::new();
+        }
+    };
+
+    match serde_json::from_str::<Vec<RawProperty>>(&text) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|property| (property.hash_key, property))
+            .collect(),
+        Err(e) => {
+            println!(
+                "cargo:warning=islands: failed to parse {} ({e}); block-state variants will be empty",
+                path.display()
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Reconstruct the canonical `k=v,k=v` property string (keys sorted) for every
+/// state of `block`, in the order the states are listed.
+///
+/// Pumpkin's dump doesn't store properties per state; instead the block lists
+/// property hash keys and the states enumerate the cartesian product of their
+/// values, last property varying fastest (see pumpkin-codegen's
+/// `from_index`/`to_index`). Decode position `i` by iterating the properties
+/// in reverse, peeling `i % variant_count` each time.
+///
+/// Returns `None` (no variants for this block) when the block has no
+/// properties, a hash is missing from the registry, a property type is
+/// unknown, or the value-count product doesn't match the state count.
+fn decode_state_properties(
+    block: &RawBlock,
+    registry: &BTreeMap<i32, RawProperty>,
+) -> Option<Vec<String>> {
+    if block.properties.is_empty() {
+        return None;
+    }
+
+    let mut props: Vec<(&str, Vec<String>)> = Vec::with_capacity(block.properties.len());
+    let mut product = 1usize;
+    for hash in &block.properties {
+        let property = registry.get(hash)?;
+        let values = property.value_list()?;
+        if values.is_empty() {
+            return None;
+        }
+        product = product.checked_mul(values.len())?;
+        props.push((property.serialized_name.as_str(), values));
+    }
+    if product != block.states.len() {
+        println!(
+            "cargo:warning=islands: {}: property value product {product} != state count {}; \
+             skipping variants for this block",
+            block.name,
+            block.states.len()
+        );
+        return None;
+    }
+
+    let keys = (0..block.states.len())
+        .map(|state_index| {
+            // BTreeMap iterates keys sorted, matching mapping.rs::canonical_props.
+            let mut decoded: BTreeMap<&str, &str> = BTreeMap::new();
+            let mut index = state_index;
+            for (name, values) in props.iter().rev() {
+                decoded.insert(name, values[index % values.len()].as_str());
+                index /= values.len();
+            }
+            decoded
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    Some(keys)
 }
 
 fn empty_table() -> String {
@@ -255,7 +395,11 @@ fn color_intensity(color: u32) -> u16 {
 /// Two shapes are supported:
 /// 1. A bare array of blocks: `[ {name, states, ...}, ... ]`
 /// 2. An object: `{ "blocks": [ ... ] }` or a mojang map `{ "minecraft:stone": {...} }`
-fn generate_from_json(text: &str) -> Result<String, String> {
+///
+/// Per-state property strings come from the state's own `properties` map when
+/// the dump carries one (mojang style), otherwise they are reconstructed from
+/// the block's property hash list and `registry` (Pumpkin style).
+fn generate_from_json(text: &str, registry: &BTreeMap<i32, RawProperty>) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
     let blocks: Vec<RawBlock> = if let Some(arr) = value.as_array() {
@@ -285,6 +429,7 @@ fn generate_from_json(text: &str) -> Result<String, String> {
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
                         .unwrap_or(0),
                     default_state_id,
+                    properties: Vec::new(),
                     states,
                 })
             })
@@ -330,8 +475,9 @@ fn generate_from_json(text: &str) -> Result<String, String> {
         };
         let block_index = count as u16;
 
+        let decoded_props = decode_state_properties(block, registry);
         let mut variants = String::new();
-        for state in &block.states {
+        for (state_index, state) in block.states.iter().enumerate() {
             if let Some(props) = &state.properties
                 && !props.is_empty()
             {
@@ -341,6 +487,9 @@ fn generate_from_json(text: &str) -> Result<String, String> {
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(",");
+                variants.push_str(&format!("({key:?}, {}), ", state.id));
+            } else if let Some(keys) = &decoded_props {
+                let key = &keys[state_index];
                 variants.push_str(&format!("({key:?}, {}), ", state.id));
             }
 
