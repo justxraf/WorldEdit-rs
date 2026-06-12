@@ -18,7 +18,7 @@ Comprehensive, phased plan for bringing [`src/commands/brush.rs`](src/commands/b
 - [x] Brush bindings already preserve mask and range across rebinds.
 - [x] Current permission nodes already exist for implemented brushes and brush option commands.
 - [x] Current brush apply paths already push history entries.
-- [ ] Brush bindings still need transform state, trace/target mask state, target mode, scroll action state, and visualization state.
+- [x] Brush bindings still need transform state, trace/target mask state, target mode, scroll action state, and visualization state.
 - [ ] Parser still needs broader FAWE flag coverage and exact FAWE argument parity.
 
 ## Phase 1: Foundations
@@ -26,20 +26,20 @@ Comprehensive, phased plan for bringing [`src/commands/brush.rs`](src/commands/b
 Priority: P0. Finish the brush framework before adding more brush families.
 
 - [x] Keep the expanded `BrushKind`/summary/permission/setter surface for currently implemented brushes.
-- [ ] Add remaining `BrushKind` variants needed for planned block-capable brushes: `Flatten`, `Height`, `Heightmap`, `Overlay`, `Surface`, `BlendBall`, `Scatter`, `ScatterOverlay`, `ScatterCommand`, `Spline`, `SurfaceSpline`, `Sweep`, `Catenary`, `Shatter`, `Command`, and `PopulateSchematic`.
+- [x] Add remaining `BrushKind` variants needed for planned block-capable brushes: `Flatten`, `Height`, `Heightmap`, `Overlay`, `Surface`, `BlendBall`, `Scatter`, `ScatterOverlay`, `ScatterCommand`, `Spline`, `SurfaceSpline`, `Sweep`, `Catenary`, `Shatter`, `Command`, and `PopulateSchematic`.
 - [x] Keep existing parser coverage for current brush commands and settings.
-- [ ] Extend parsing for additional FAWE flags where Pumpkin can support them cleanly.
-- [ ] Add explicit parsing and storage for target modes `0..=3`.
-- [ ] Add `/br vis` state storage as a stub, even if rendering remains unavailable.
-- [ ] Add scroll action parsing/storage as a stub for size, range, and pattern switching.
+- [x] Extend parsing for additional FAWE flags where Pumpkin can support them cleanly.
+- [x] Add explicit parsing and storage for target modes `0..=3`.
+- [x] Add `/br vis` state storage as a stub, even if rendering remains unavailable.
+- [x] Add scroll action parsing/storage as a stub for size, range, and pattern switching.
 - [x] Keep `BrushBinding` support for mask and range.
-- [ ] Extend `BrushBinding` with target mode, trace mask, target mask, transform settings, visualization mode, and scroll action.
+- [x] Extend `BrushBinding` with target mode, trace mask, target mask, transform settings, visualization mode, and scroll action.
 - [x] Keep the generic `apply_pattern_positions` helper for shape-based block application.
-- [ ] Generalize position generation so new brushes can reuse shared scatter, noise, overlay, and surface-following helpers.
+- [x] Generalize position generation so new brushes can reuse shared scatter, noise, overlay, and surface-following helpers.
 - [x] Keep current `worldedit.brush.*` permissions wired through `src/commands/mod.rs`.
-- [ ] Expand permission registration for every new brush and option node.
+- [x] Expand permission registration for every new brush and option node.
 - [x] Keep history integration mandatory for all current brush implementations.
-- [ ] Add regression tests covering parser behavior, binding persistence, and history for new brush families.
+- [x] Add regression tests covering parser behavior, binding persistence, and history for new brush families.
 
 ## Phase 2: Core brushes
 
@@ -48,18 +48,18 @@ Priority: P1. Focus on brushes that fit Pumpkin's existing world/block model.
 - [x] Sphere / Cylinder / Set / Cuboid: solid baseline exists.
 - [ ] Add missing variants and FAWE-style argument parity for the shape brushes.
 - [x] Clipboard / Copypaste: basic clipboard paste brush with `-a` and `-o` exists.
-- [ ] Expand clipboard brush support with any feasible additional flags and clearer unsupported messaging for `-r` / full FAWE-only behavior.
+- [x] Expand clipboard brush support with any feasible additional flags and clearer unsupported messaging for `-r` / full FAWE-only behavior.
 - [ ] Add scatter-style clipboard placement and `populate schematic` support if it can be backed by the existing clipboard/schematic code.
 - [x] Smooth: base smoothing implementation exists.
 - [ ] Add dedicated `Flatten` behavior and refine smoothing options toward FAWE defaults.
 - [x] Gravity / Extinguish: baseline implementations exist.
 - [x] Splatter / Blob: splatter-style probabilistic placement exists.
-- [ ] Improve splatter/blob behavior with better seeded noise and density controls.
+- [x] Improve splatter/blob behavior with better seeded noise and density controls.
 - [x] Raise / Lower / Erode / Dilate / Morph: baseline terrain sculpting exists.
 - [ ] Improve terrain tools to behave more like FAWE presets and document any intentional deviations.
 - [x] Snow: baseline implementation exists.
 - [ ] Extend snow behavior for better layering parity and mask interactions.
-- [ ] Height / Heightmap: implement top-column terrain shaping using `top_solid_in_column` plus pattern support.
+- [x] Height / Heightmap: implement top-column terrain shaping using `top_solid_in_column` plus pattern support.
 
 ## Phase 3: Advanced brushes
 
@@ -94,12 +94,12 @@ Priority: P3. Improve parity, usability, and safety after the block-capable brus
 
 - [x] 1. Audit current implementation and constraints.
 - [ ] 2. Audit FAWE source/docs for exact brush names, aliases, defaults, and flags.
-- [ ] 3. Extend parser, literals, and binding state before adding new apply functions.
-- [ ] 4. Add shared helpers for targeting, surfaces, scatter, and noise-driven positions.
+- [x] 3. Extend parser, literals, and binding state before adding new apply functions.
+- [x] 4. Add shared helpers for targeting, surfaces, scatter, and noise-driven positions.
 - [ ] 5. Implement P1 block-capable brushes first: shape parity, clipboard expansion, flatten, terrain tools, height/heightmap.
 - [ ] 6. Implement P2 advanced block-capable brushes: scatter, overlay/surface, spline family, shatter, populate schematic.
-- [ ] 7. Add or expand tests for parsing, binding persistence, and apply behavior.
-- [ ] 8. Fill out permissions, usage text, and unsupported error messages.
+- [x] 7. Add or expand tests for parsing, binding persistence, and apply behavior.
+- [x] 8. Fill out permissions, usage text, and unsupported error messages.
 - [ ] 9. Add docstrings and command help text that match the supported FAWE subset accurately.
 
 ## Notes for future passes
