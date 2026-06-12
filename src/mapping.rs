@@ -105,6 +105,106 @@ pub fn resolve_block(input: &str) -> Option<u16> {
     state_id_for(trimmed)
 }
 
+/// Return every known state id for a block name. If a property-qualified key is
+/// supplied, this returns only the exact resolved state.
+pub fn state_ids_for_block(input: &str) -> Vec<u16> {
+    let trimmed = input.trim();
+    if trimmed.parse::<u16>().is_ok() {
+        return resolve_block(trimmed).into_iter().collect();
+    }
+
+    let (name, props) = split_key(trimmed);
+    let name = normalize(name);
+    if let Some(block) = find_generated(&name) {
+        if !props.is_empty() {
+            return state_id_for(trimmed).into_iter().collect();
+        }
+
+        let mut states = Vec::new();
+        if block.variants.is_empty() {
+            states.push(block.default_id);
+        } else {
+            for &(_, id) in block.variants {
+                if !states.contains(&id) {
+                    states.push(id);
+                }
+            }
+        }
+        return states;
+    }
+
+    resolve_block(trimmed).into_iter().collect()
+}
+
+/// Best-effort block-tag support for FAWE/WorldEdit category patterns
+/// (`##wool`, `##*slabs`) using the generated block registry. Pumpkin does not
+/// expose data-pack tags here, so this matches common vanilla category suffixes.
+pub fn state_ids_for_tag(tag: &str, all_states: bool) -> Vec<u16> {
+    let tag = normalize_tag(tag);
+    let mut states = Vec::new();
+
+    for block in GENERATED_BLOCKS {
+        if !block_matches_tag(block.name, &tag) {
+            continue;
+        }
+        if all_states && !block.variants.is_empty() {
+            for &(_, id) in block.variants {
+                if !states.contains(&id) {
+                    states.push(id);
+                }
+            }
+        } else if !states.contains(&block.default_id) {
+            states.push(block.default_id);
+        }
+    }
+
+    states
+}
+
+/// Apply the property string from `before` to the block type represented by
+/// `target_state`, falling back to the target's default if that state
+/// combination does not exist.
+pub fn apply_existing_states(target_state: u16, before: u16) -> Option<u16> {
+    let target_key = palette_key_for_state_id(target_state);
+    let before_key = palette_key_for_state_id(before);
+    let (target_name, _) = split_key(&target_key);
+    let (_, before_props) = split_key(&before_key);
+    if before_props.is_empty() {
+        return Some(target_state);
+    }
+    let candidate = format!("{}[{}]", target_name, canonical_props(&before_props));
+    state_id_for(&candidate).or(Some(target_state))
+}
+
+/// Apply explicit block-state properties to an existing state id.
+pub fn apply_state_properties(before: u16, props: &str) -> Option<u16> {
+    let before_key = palette_key_for_state_id(before);
+    let (name, existing_props) = split_key(&before_key);
+    let mut merged: Vec<String> = existing_props.into_iter().map(str::to_string).collect();
+
+    for prop in props
+        .split(',')
+        .map(str::trim)
+        .filter(|prop| !prop.is_empty())
+    {
+        let key = prop.split_once('=').map_or(prop, |(key, _)| key).trim();
+        merged.retain(|existing| {
+            existing
+                .split_once('=')
+                .map_or(existing.as_str(), |(k, _)| k)
+                != key
+        });
+        merged.push(prop.to_string());
+    }
+
+    if merged.is_empty() {
+        return Some(before);
+    }
+    let refs: Vec<&str> = merged.iter().map(String::as_str).collect();
+    let candidate = format!("{}[{}]", name, canonical_props(&refs));
+    state_id_for(&candidate).or(Some(before))
+}
+
 /// `true` when the full generated table is present (vs. only the fallback).
 pub fn has_full_registry() -> bool {
     !GENERATED_BLOCKS.is_empty()
@@ -186,6 +286,29 @@ fn humanize(name: &str) -> String {
 
 fn find_generated(name: &str) -> Option<&'static GeneratedBlock> {
     GENERATED_BLOCKS.iter().find(|b| b.name == name)
+}
+
+fn normalize_tag(tag: &str) -> String {
+    let tag = tag
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('*')
+        .strip_prefix("minecraft:")
+        .unwrap_or_else(|| tag.trim().trim_start_matches('#').trim_start_matches('*'));
+    tag.to_ascii_lowercase()
+}
+
+fn block_matches_tag(block_name: &str, tag: &str) -> bool {
+    let block = block_name
+        .strip_prefix("minecraft:")
+        .unwrap_or(block_name)
+        .to_ascii_lowercase();
+    if block == tag || block.ends_with(&format!("_{tag}")) {
+        return true;
+    }
+
+    let singular = tag.strip_suffix('s').unwrap_or(tag);
+    block == singular || block.ends_with(&format!("_{singular}"))
 }
 
 /// Split `"minecraft:oak_log[axis=x,foo=bar]"` into

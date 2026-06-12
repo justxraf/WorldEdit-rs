@@ -15,7 +15,7 @@ use pumpkin_plugin_api::{
     command::{Command, CommandError, CommandNode, CommandSender, ConsumedArgs},
     command_wit::{Arg, ArgumentType, StringType},
     common::BlockPos,
-    events::{BlockBreakEvent, EventHandler, EventPriority, InteractAction, PlayerInteractEvent},
+    events::{BlockBreakEvent, EventHandler, EventPriority, PlayerInteractEvent},
     logging::{self, LogLevel},
     player::{Hand, Player},
     text::TextComponent,
@@ -26,7 +26,7 @@ use crate::{
     clipboard,
     history::{self, EditEntry},
     mapping,
-    pattern::{BlockMask, BlockPattern},
+    pattern::{BlockMask, BlockPattern, PatternEvalContext},
 };
 
 use super::{batch_size, block_flags, permission_node, player_key, require_permission};
@@ -54,6 +54,53 @@ pub fn register(context: &Context) {
         "Bind or configure a brush on your held item",
     )
     .execute(BrushCommand);
+    for (name, prefix) in [
+        ("none", "none"),
+        ("unbind", "none"),
+        ("list", "list"),
+        ("info", "list"),
+        ("size", "size"),
+        ("material", "material"),
+        ("mat", "material"),
+        ("mask", "mask"),
+        ("range", "range"),
+        ("tracemask", "tracemask"),
+        ("targetmask", "tracemask"),
+        ("vis", "vis"),
+        ("sphere", "sphere"),
+        ("s", "sphere"),
+        ("cylinder", "cylinder"),
+        ("cyl", "cylinder"),
+        ("c", "cylinder"),
+        ("set", "set"),
+        ("clipboard", "clipboard"),
+        ("copy", "clipboard"),
+        ("smooth", "smooth"),
+        ("gravity", "gravity"),
+        ("grav", "gravity"),
+        ("extinguish", "extinguish"),
+        ("ex", "extinguish"),
+        ("splatter", "splatter"),
+        ("splat", "splatter"),
+        ("raise", "raise"),
+        ("lower", "lower"),
+        ("erode", "erode"),
+        ("dilate", "dilate"),
+        ("morph", "morph"),
+        ("snow", "snow"),
+        ("forest", "forest"),
+        ("butcher", "butcher"),
+        ("kill", "kill"),
+        ("paint", "paint"),
+        ("snowsmooth", "snowsmooth"),
+        ("heightmap", "heightmap"),
+        ("feature", "feature"),
+        ("apply", "apply"),
+        ("deform", "deform"),
+        ("biome", "biome"),
+    ] {
+        command.then(brush_literal(name, prefix));
+    }
     command.then(args);
     context.register_command(command, BRUSH_COMMAND_PERMISSION);
 
@@ -74,6 +121,9 @@ pub fn register(context: &Context) {
 }
 
 struct BrushCommand;
+struct BrushLiteralCommand {
+    prefix: &'static str,
+}
 
 impl pumpkin_plugin_api::commands::CommandHandler for BrushCommand {
     fn handle(
@@ -82,15 +132,6 @@ impl pumpkin_plugin_api::commands::CommandHandler for BrushCommand {
         server: pumpkin_plugin_api::Server,
         args: ConsumedArgs,
     ) -> std::result::Result<i32, CommandError> {
-        let Some(player) = sender.as_player() else {
-            sender.send_error(TextComponent::text("Only players can use brush commands."));
-            return Ok(0);
-        };
-        let Some(key) = player_key(&sender) else {
-            sender.send_error(TextComponent::text("Could not determine your identity."));
-            return Ok(0);
-        };
-
         let raw = match args.get_value("args") {
             Arg::Simple(s) | Arg::Msg(s) => s,
             _ => {
@@ -99,120 +140,193 @@ impl pumpkin_plugin_api::commands::CommandHandler for BrushCommand {
             }
         };
 
-        let command = match parse_brush_command(&raw) {
-            Ok(command) => command,
-            Err(message) => {
-                sender.send_error(TextComponent::text(&message));
+        handle_brush_command(sender, server, raw)
+    }
+}
+
+impl pumpkin_plugin_api::commands::CommandHandler for BrushLiteralCommand {
+    fn handle(
+        &self,
+        sender: CommandSender,
+        server: pumpkin_plugin_api::Server,
+        args: ConsumedArgs,
+    ) -> std::result::Result<i32, CommandError> {
+        let tail = match args.get_value("args") {
+            Arg::Simple(s) | Arg::Msg(s) => s,
+            _ => String::new(),
+        };
+        let raw = if tail.trim().is_empty() {
+            self.prefix.to_string()
+        } else {
+            format!("{} {}", self.prefix, tail)
+        };
+        handle_brush_command(sender, server, raw)
+    }
+}
+
+fn handle_brush_command(
+    sender: CommandSender,
+    server: pumpkin_plugin_api::Server,
+    raw: String,
+) -> std::result::Result<i32, CommandError> {
+    let Some(player) = sender.as_player() else {
+        sender.send_error(TextComponent::text("Only players can use brush commands."));
+        return Ok(0);
+    };
+    let Some(key) = player_key(&sender) else {
+        sender.send_error(TextComponent::text("Could not determine your identity."));
+        return Ok(0);
+    };
+
+    let command = match parse_brush_command(&raw) {
+        Ok(command) => command,
+        Err(message) => {
+            sender.send_error(TextComponent::text(&message));
+            return Ok(0);
+        }
+    };
+
+    match command {
+        ParsedBrushCommand::Bind(binding) => {
+            if require_permission(&sender, &server, binding.kind.permission()).is_err() {
                 return Ok(0);
             }
-        };
-
-        match command {
-            ParsedBrushCommand::Bind(binding) => {
-                if require_permission(&sender, &server, binding.kind.permission()).is_err() {
-                    return Ok(0);
-                }
-                let Some(item) = held_item_key(&player) else {
-                    sender.send_error(TextComponent::text(
-                        "Hold an item, then run the brush command again.",
-                    ));
-                    return Ok(0);
-                };
-                let summary = binding.kind.summary();
-                let range = binding.range;
-                BRUSHES.with_borrow_mut(|map| {
-                    let tools = map.entry(key).or_default();
-                    tools.bindings.insert(item.clone(), binding);
-                });
+            let Some(item) = held_item_key(&player) else {
+                sender.send_error(TextComponent::text(
+                    "Hold an item, then run the brush command again.",
+                ));
+                return Ok(0);
+            };
+            let summary = binding.kind.summary();
+            let item_label = item.label();
+            let mut range = DEFAULT_RANGE;
+            BRUSHES.with_borrow_mut(|map| {
+                let tools = map.entry(key).or_default();
+                let binding = BrushBinding::with_kind(binding.kind, tools.bindings.get(&item));
+                range = binding.range;
+                tools.bindings.insert(item.clone(), binding);
+            });
+            sender.send_message(TextComponent::text(&format!(
+                "Bound {summary} to {item_label}. Range: {range:.0} blocks."
+            )));
+            Ok(1)
+        }
+        ParsedBrushCommand::Unbind => {
+            let Some(item) = held_item_key(&player) else {
+                sender.send_error(TextComponent::text("Hold the brush item to unbind it."));
+                return Ok(0);
+            };
+            let removed = BRUSHES.with_borrow_mut(|map| {
+                map.get_mut(&key)
+                    .and_then(|tools| tools.bindings.remove(&item))
+                    .is_some()
+            });
+            if removed {
                 sender.send_message(TextComponent::text(&format!(
-                    "Bound {summary} to {item}. Range: {range:.0} blocks."
+                    "Unbound brush from {}.",
+                    item.label()
                 )));
                 Ok(1)
+            } else {
+                sender.send_error(TextComponent::text("That item has no brush bound."));
+                Ok(0)
             }
-            ParsedBrushCommand::Unbind => {
-                let Some(item) = held_item_key(&player) else {
-                    sender.send_error(TextComponent::text("Hold the brush item to unbind it."));
-                    return Ok(0);
-                };
-                let removed = BRUSHES.with_borrow_mut(|map| {
-                    map.get_mut(&key)
-                        .and_then(|tools| tools.bindings.remove(&item))
-                        .is_some()
-                });
-                if removed {
-                    sender
-                        .send_message(TextComponent::text(&format!("Unbound brush from {item}.")));
+        }
+        ParsedBrushCommand::Setting(setting) => {
+            if require_permission(&sender, &server, setting.permission()).is_err() {
+                return Ok(0);
+            }
+            let Some(item) = held_item_key(&player) else {
+                sender.send_error(TextComponent::text("Hold a brush item to configure it."));
+                return Ok(0);
+            };
+            let result = BRUSHES.with_borrow_mut(|map| {
+                map.get_mut(&key)
+                    .and_then(|tools| tools.bindings.get_mut(&item))
+                    .map(|binding| setting.apply(binding))
+            });
+            match result {
+                Some(Ok(message)) => {
+                    sender.send_message(TextComponent::text(&message));
                     Ok(1)
-                } else {
+                }
+                Some(Err(message)) => {
+                    sender.send_error(TextComponent::text(&message));
+                    Ok(0)
+                }
+                None => {
                     sender.send_error(TextComponent::text("That item has no brush bound."));
                     Ok(0)
                 }
             }
-            ParsedBrushCommand::Setting(setting) => {
-                if require_permission(&sender, &server, setting.permission()).is_err() {
-                    return Ok(0);
-                }
-                let Some(item) = held_item_key(&player) else {
-                    sender.send_error(TextComponent::text("Hold a brush item to configure it."));
-                    return Ok(0);
-                };
-                let result = BRUSHES.with_borrow_mut(|map| {
-                    map.get_mut(&key)
-                        .and_then(|tools| tools.bindings.get_mut(&item))
-                        .map(|binding| setting.apply(binding))
-                });
-                match result {
-                    Some(Ok(message)) => {
-                        sender.send_message(TextComponent::text(&message));
-                        Ok(1)
-                    }
-                    Some(Err(message)) => {
-                        sender.send_error(TextComponent::text(&message));
-                        Ok(0)
-                    }
-                    None => {
-                        sender.send_error(TextComponent::text("That item has no brush bound."));
-                        Ok(0)
-                    }
-                }
-            }
-            ParsedBrushCommand::List => {
-                let list = BRUSHES.with_borrow(|map| {
-                    map.get(&key).map_or_else(Vec::new, |tools| {
-                        tools
-                            .bindings
-                            .iter()
-                            .map(|(item, binding)| format!("{item}: {}", binding.kind.summary()))
-                            .collect()
-                    })
-                });
-                if list.is_empty() {
-                    sender.send_message(TextComponent::text("You have no brushes bound."));
-                } else {
-                    sender.send_message(TextComponent::text(&format!(
-                        "Bound brushes: {}.",
-                        list.join("; ")
-                    )));
-                }
-                Ok(1)
-            }
-            ParsedBrushCommand::Unsupported { name, reason } => {
-                sender.send_error(TextComponent::text(&format!(
-                    "Brush '{name}' is recognized, but {reason}"
+        }
+        ParsedBrushCommand::List => {
+            let list = BRUSHES.with_borrow(|map| {
+                map.get(&key).map_or_else(Vec::new, |tools| {
+                    tools
+                        .bindings
+                        .iter()
+                        .map(|(item, binding)| {
+                            format!(
+                                "{}: {}{}; range {:.0}",
+                                item.label(),
+                                binding.kind.summary(),
+                                binding
+                                    .mask
+                                    .as_ref()
+                                    .map_or(String::new(), |_| ", masked".to_string()),
+                                binding.range
+                            )
+                        })
+                        .collect()
+                })
+            });
+            if list.is_empty() {
+                sender.send_message(TextComponent::text("You have no brushes bound."));
+            } else {
+                sender.send_message(TextComponent::text(&format!(
+                    "Bound brushes: {}.",
+                    list.join("; ")
                 )));
-                Ok(0)
             }
+            Ok(1)
+        }
+        ParsedBrushCommand::Unsupported { name, reason } => {
+            sender.send_error(TextComponent::text(&format!(
+                "Brush '{name}' is recognized, but {reason}"
+            )));
+            Ok(0)
         }
     }
 }
 
+fn brush_literal(name: &str, prefix: &'static str) -> CommandNode {
+    let args = CommandNode::argument("args", &ArgumentType::String(StringType::Greedy))
+        .execute(BrushLiteralCommand { prefix });
+    let node = CommandNode::literal(name).execute(BrushLiteralCommand { prefix });
+    node.then(args);
+    node
+}
+
 #[derive(Default)]
 struct PlayerBrushes {
-    bindings: HashMap<String, BrushBinding>,
+    bindings: HashMap<ToolBindingKey, BrushBinding>,
 }
 
 thread_local! {
     static BRUSHES: RefCell<HashMap<String, PlayerBrushes>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ToolBindingKey {
+    slot: u8,
+    item: String,
+}
+
+impl ToolBindingKey {
+    fn label(&self) -> String {
+        format!("slot {} ({})", self.slot + 1, self.item)
+    }
 }
 
 #[derive(Clone)]
@@ -220,6 +334,16 @@ struct BrushBinding {
     kind: BrushKind,
     mask: Option<BlockMask>,
     range: f64,
+}
+
+impl BrushBinding {
+    fn with_kind(kind: BrushKind, existing: Option<&BrushBinding>) -> Self {
+        Self {
+            kind,
+            mask: existing.and_then(|binding| binding.mask.clone()),
+            range: existing.map_or(DEFAULT_RANGE, |binding| binding.range),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -537,6 +661,7 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
             }
             Ok(ParsedBrushCommand::Setting(BrushSetting::TraceMask))
         }
+        "vis" => parse_vis(args),
         "sphere" | "s" => parse_sphere(args),
         "cylinder" | "cyl" | "c" => parse_cylinder(args),
         "set" => parse_set(args),
@@ -558,6 +683,24 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
         }),
         _ => Err(format!("Unknown brush '{name}'.")),
     }
+}
+
+fn parse_vis(args: &[String]) -> Result<ParsedBrushCommand, String> {
+    if let Some(mode) = args.first() {
+        let mode = parse_i32(Some(mode), "visualization mode")?;
+        if !(0..=2).contains(&mode) {
+            return Err("Brush visualization mode must be 0, 1, or 2.".to_string());
+        }
+    }
+    if let Some(unexpected) = args.get(1) {
+        return Err(format!(
+            "Unexpected brush visualization argument '{unexpected}'."
+        ));
+    }
+    Ok(ParsedBrushCommand::Unsupported {
+        name: "vis".to_string(),
+        reason: "brush visualization is not implemented yet.",
+    })
 }
 
 fn parse_sphere(args: &[String]) -> Result<ParsedBrushCommand, String> {
@@ -758,11 +901,7 @@ fn parse_snow(args: &[String]) -> Result<ParsedBrushCommand, String> {
 }
 
 fn bind(kind: BrushKind) -> ParsedBrushCommand {
-    ParsedBrushCommand::Bind(BrushBinding {
-        kind,
-        mask: None,
-        range: DEFAULT_RANGE,
-    })
+    ParsedBrushCommand::Bind(BrushBinding::with_kind(kind, None))
 }
 
 fn consume_hollow(args: &[String]) -> (bool, &[String]) {
@@ -825,15 +964,18 @@ fn tokenize(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(str::to_string).collect()
 }
 
-fn held_item_key(player: &Player) -> Option<String> {
+fn held_item_key(player: &Player) -> Option<ToolBindingKey> {
     player
         .get_item_in_hand(Hand::Right)
-        .map(|stack| stack.get_registry_key())
+        .map(|stack| ToolBindingKey {
+            slot: player.get_selected_slot(),
+            item: stack.get_registry_key(),
+        })
 }
 
 fn send_brush_usage(sender: &CommandSender) {
     sender.send_error(TextComponent::text(
-        "Usage: //brush <sphere|cylinder|set|clipboard|smooth|gravity|extinguish|splatter|raise|lower|erode|dilate|morph|snow|none|list|size|material|mask|range> ...",
+        "Usage: //brush <sphere|cylinder|set|clipboard|smooth|gravity|extinguish|splatter|raise|lower|erode|dilate|morph|snow|none|list|size|material|mask|range|tracemask|vis> ...",
     ));
 }
 
@@ -845,16 +987,7 @@ impl EventHandler<PlayerInteractEvent> for BrushInteractHandler {
         _server: pumpkin_plugin_api::Server,
         mut data: pumpkin_plugin_api::events::EventData<PlayerInteractEvent>,
     ) -> pumpkin_plugin_api::events::EventData<PlayerInteractEvent> {
-        if !matches!(
-            data.action,
-            InteractAction::RightClickBlock | InteractAction::LeftClickBlock
-        ) {
-            return data;
-        }
-        let Some(target) = data.clicked_pos else {
-            return data;
-        };
-        if trigger_player_brush(&data.player, target) {
+        if trigger_player_brush(&data.player, data.clicked_pos) {
             data.cancelled = true;
         }
         data
@@ -872,14 +1005,14 @@ impl EventHandler<BlockBreakEvent> for BrushBreakHandler {
         let Some(player) = &data.player else {
             return data;
         };
-        if trigger_player_brush(player, data.block_pos) {
+        if trigger_player_brush(player, Some(data.block_pos)) {
             data.cancelled = true;
         }
         data
     }
 }
 
-fn trigger_player_brush(player: &Player, clicked: BlockPos) -> bool {
+fn trigger_player_brush(player: &Player, clicked: Option<BlockPos>) -> bool {
     let Some(item) = held_item_key(player) else {
         return false;
     };
@@ -899,13 +1032,33 @@ fn trigger_player_brush(player: &Player, clicked: BlockPos) -> bool {
         return true;
     }
 
-    let target = match player.as_entity().raycast(binding.range, false) {
-        Some(hit) => hit.pos,
-        None => clicked,
+    let target = match player
+        .as_entity()
+        .raycast(binding.range, false)
+        .map(|hit| hit.pos)
+        .or(clicked)
+    {
+        Some(target) => target,
+        None => {
+            player.send_system_message(
+                TextComponent::text(&format!(
+                    "No target block in range ({:.0} blocks).",
+                    binding.range
+                )),
+                true,
+            );
+            return true;
+        }
     };
     let world = player.get_world();
     let started = std::time::Instant::now();
-    let changed = apply_brush(&key, &world, target, &binding);
+    let changed = match apply_brush(&key, &world, target, &binding) {
+        Ok(changed) => changed,
+        Err(message) => {
+            player.send_system_message(TextComponent::text(&message), true);
+            return true;
+        }
+    };
     logging::log(
         LogLevel::Info,
         &format!(
@@ -921,54 +1074,72 @@ fn trigger_player_brush(player: &Player, clicked: BlockPos) -> bool {
     true
 }
 
-fn apply_brush(key: &str, world: &World, target: BlockPos, binding: &BrushBinding) -> usize {
+fn apply_brush(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    binding: &BrushBinding,
+) -> Result<usize, String> {
+    let pattern_ctx = PatternEvalContext::for_player(target, key);
     match &binding.kind {
         BrushKind::Sphere {
             pattern,
             radius,
             hollow,
-        } => apply_pattern_positions(
-            key,
-            world,
-            sphere_positions(target, *radius, *hollow),
-            pattern,
-            binding.mask.as_ref(),
-        ),
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_pattern_positions(
+                key,
+                world,
+                sphere_positions(target, *radius, *hollow),
+                pattern,
+                &pattern_ctx,
+                binding.mask.as_ref(),
+            ))
+        }
         BrushKind::Cylinder {
             pattern,
             radius,
             height,
             hollow,
-        } => apply_pattern_positions(
-            key,
-            world,
-            cylinder_positions(target, *radius, *height, *hollow),
-            pattern,
-            binding.mask.as_ref(),
-        ),
-        BrushKind::Cuboid { pattern, radius } => apply_pattern_positions(
-            key,
-            world,
-            cuboid_positions(target, *radius),
-            pattern,
-            binding.mask.as_ref(),
-        ),
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_pattern_positions(
+                key,
+                world,
+                cylinder_positions(target, *radius, *height, *hollow),
+                pattern,
+                &pattern_ctx,
+                binding.mask.as_ref(),
+            ))
+        }
+        BrushKind::Cuboid { pattern, radius } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_pattern_positions(
+                key,
+                world,
+                cuboid_positions(target, *radius),
+                pattern,
+                &pattern_ctx,
+                binding.mask.as_ref(),
+            ))
+        }
         BrushKind::Clipboard {
             skip_air,
             paste_at_origin,
-        } => apply_clipboard(
+        } => Ok(apply_clipboard(
             key,
             world,
             target,
             *skip_air,
             *paste_at_origin,
             binding.mask.as_ref(),
-        ),
+        )),
         BrushKind::Smooth {
             radius,
             iterations,
             height_mask,
-        } => apply_smooth(
+        } => Ok(apply_smooth(
             key,
             world,
             target,
@@ -976,29 +1147,42 @@ fn apply_brush(key: &str, world: &World, target: BlockPos, binding: &BrushBindin
             *iterations,
             height_mask.as_ref(),
             binding.mask.as_ref(),
-        ),
-        BrushKind::Gravity { radius, height } => {
-            apply_gravity(key, world, target, *radius, *height, binding.mask.as_ref())
-        }
-        BrushKind::Extinguish { radius } => {
-            apply_extinguish(key, world, target, *radius, binding.mask.as_ref())
-        }
+        )),
+        BrushKind::Gravity { radius, height } => Ok(apply_gravity(
+            key,
+            world,
+            target,
+            *radius,
+            *height,
+            binding.mask.as_ref(),
+        )),
+        BrushKind::Extinguish { radius } => Ok(apply_extinguish(
+            key,
+            world,
+            target,
+            *radius,
+            binding.mask.as_ref(),
+        )),
         BrushKind::Splatter {
             pattern,
             radius,
             decay,
-        } => apply_pattern_positions(
-            key,
-            world,
-            splatter_positions(target, *radius, *decay),
-            pattern,
-            binding.mask.as_ref(),
-        ),
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_pattern_positions(
+                key,
+                world,
+                splatter_positions(target, *radius, *decay),
+                pattern,
+                &pattern_ctx,
+                binding.mask.as_ref(),
+            ))
+        }
         BrushKind::Raise {
             shape,
             radius,
             lower,
-        } => apply_raise_lower(
+        } => Ok(apply_raise_lower(
             key,
             world,
             target,
@@ -1006,14 +1190,14 @@ fn apply_brush(key: &str, world: &World, target: BlockPos, binding: &BrushBindin
             *radius,
             *lower,
             binding.mask.as_ref(),
-        ),
+        )),
         BrushKind::Morph {
             radius,
             min_erode_faces,
             erode_iterations,
             min_dilate_faces,
             dilate_iterations,
-        } => apply_morph(
+        } => Ok(apply_morph(
             key,
             world,
             target,
@@ -1023,12 +1207,12 @@ fn apply_brush(key: &str, world: &World, target: BlockPos, binding: &BrushBindin
             *min_dilate_faces,
             *dilate_iterations,
             binding.mask.as_ref(),
-        ),
+        )),
         BrushKind::Snow {
             shape,
             radius,
             stack,
-        } => apply_snow(
+        } => Ok(apply_snow(
             key,
             world,
             target,
@@ -1036,7 +1220,7 @@ fn apply_brush(key: &str, world: &World, target: BlockPos, binding: &BrushBindin
             *radius,
             *stack,
             binding.mask.as_ref(),
-        ),
+        )),
     }
 }
 
@@ -1045,6 +1229,7 @@ fn apply_pattern_positions(
     world: &World,
     positions: Vec<BlockPos>,
     pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
     mask: Option<&BlockMask>,
 ) -> usize {
     let mut entry = EditEntry::default();
@@ -1056,7 +1241,7 @@ fn apply_pattern_positions(
             if mask.is_some_and(|mask| !mask.matches(before)) {
                 continue;
             }
-            let after = pattern.state_at(pos, before);
+            let after = pattern.state_at_with(pos, before, pattern_ctx);
             if before == after {
                 continue;
             }
@@ -1606,6 +1791,36 @@ mod tests {
             parse_brush_command("mask none").unwrap(),
             ParsedBrushCommand::Setting(BrushSetting::Mask(None))
         ));
+    }
+
+    #[test]
+    fn recognizes_vis_as_unsupported() {
+        let ParsedBrushCommand::Unsupported { name, .. } =
+            parse_brush_command("vis 2").expect("valid vis command")
+        else {
+            panic!("expected unsupported vis");
+        };
+        assert_eq!(name, "vis");
+    }
+
+    #[test]
+    fn rebinding_preserves_mask_and_range() {
+        let existing = BrushBinding {
+            kind: BrushKind::Extinguish { radius: 3 },
+            mask: Some(BlockMask::parse("stone").expect("valid mask")),
+            range: 42.0,
+        };
+        let rebound = BrushBinding::with_kind(
+            BrushKind::Sphere {
+                pattern: BlockPattern::parse("dirt").expect("valid pattern"),
+                radius: 5.0,
+                hollow: false,
+            },
+            Some(&existing),
+        );
+        assert!(rebound.mask.is_some());
+        assert_eq!(rebound.range, 42.0);
+        assert!(matches!(rebound.kind, BrushKind::Sphere { .. }));
     }
 
     #[test]
