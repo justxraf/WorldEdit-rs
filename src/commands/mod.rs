@@ -19,6 +19,7 @@ mod copy;
 mod count;
 mod cut;
 mod flip;
+mod generation;
 mod gmask;
 mod paste;
 mod pos;
@@ -47,6 +48,8 @@ use pumpkin_plugin_api::{
 use crate::{mask, selection};
 
 const PERMISSION_NAMESPACE: &str = "worldedit-rs";
+pub(crate) const MIN_BUILD_Y: i32 = -64;
+pub(crate) const MAX_BUILD_Y: i32 = 319;
 
 /// Register every `//` command and its permission node.
 pub fn register(context: &Context) {
@@ -75,6 +78,10 @@ pub fn register(context: &Context) {
             "worldedit.brush.splatter",
             "Allows binding the splatter brush.",
         ),
+        (
+            "worldedit.brush.blendball",
+            "Allows binding the blendball brush.",
+        ),
         ("worldedit.brush.raise", "Allows binding the raise brush."),
         ("worldedit.brush.lower", "Allows binding the lower brush."),
         (
@@ -82,6 +89,37 @@ pub fn register(context: &Context) {
             "Allows binding erode, dilate, and morph brushes.",
         ),
         ("worldedit.brush.snow", "Allows binding the snow brush."),
+        (
+            "worldedit.brush.surface",
+            "Allows binding surface and overlay brushes.",
+        ),
+        ("worldedit.brush.scatter", "Allows binding scatter brushes."),
+        (
+            "worldedit.brush.scattercommand",
+            "Allows binding scatter command brushes.",
+        ),
+        (
+            "worldedit.brush.height",
+            "Allows binding height and flatten brushes.",
+        ),
+        (
+            "worldedit.brush.spline",
+            "Allows binding spline and catenary brushes.",
+        ),
+        (
+            "worldedit.brush.surfacespline",
+            "Allows binding the surface spline brush.",
+        ),
+        ("worldedit.brush.sweep", "Allows binding the sweep brush."),
+        (
+            "worldedit.brush.shatter",
+            "Allows binding the shatter brush.",
+        ),
+        ("worldedit.brush.command", "Allows binding command brushes."),
+        (
+            "worldedit.brush.populateschematic",
+            "Allows binding populate schematic brushes.",
+        ),
         (
             "worldedit.brush.options.size",
             "Allows changing a bound brush's size.",
@@ -103,6 +141,22 @@ pub fn register(context: &Context) {
             "Allows changing a bound brush's trace mask.",
         ),
         (
+            "worldedit.brush.options.targetmask",
+            "Allows changing a bound brush's target mask.",
+        ),
+        (
+            "worldedit.brush.options.vis",
+            "Allows changing a bound brush's visualization mode.",
+        ),
+        (
+            "worldedit.brush.target",
+            "Allows changing a bound brush's target mode.",
+        ),
+        (
+            "worldedit.brush.scroll",
+            "Allows changing a bound brush's scroll action.",
+        ),
+        (
             "worldedit.selection.pos",
             "Allows setting selection points with //pos1 and //pos2.",
         ),
@@ -121,6 +175,27 @@ pub fn register(context: &Context) {
         (
             "worldedit.region.replace",
             "Allows replacing blocks in the selection with //replace.",
+        ),
+        (
+            "worldedit.generation.sphere",
+            "Allows generating spheres with //sphere and //hsphere.",
+        ),
+        (
+            "worldedit.generation.cylinder",
+            "Allows generating cylinders with //cyl and //hcyl.",
+        ),
+        (
+            "worldedit.generation.pyramid",
+            "Allows generating pyramids with //pyramid and //hpyramid.",
+        ),
+        (
+            "worldedit.generation.cone",
+            "Allows generating cones with //cone.",
+        ),
+        ("worldedit.region.line", "Allows drawing lines with //line."),
+        (
+            "worldedit.region.curve",
+            "Allows drawing curves with //curve.",
         ),
         (
             "worldedit.clipboard.copy",
@@ -237,6 +312,7 @@ pub fn register(context: &Context) {
     sel::register(context);
     set::register(context);
     replace::register(context);
+    generation::register(context);
     copy::register(context);
     cut::register(context);
     paste::register(context);
@@ -258,6 +334,7 @@ pub fn register(context: &Context) {
     logging::log(
         LogLevel::Info,
         "WorldEdit-rs: //pos1, //pos2, //hpos1, //hpos2, //sel, //set, //replace, //copy, //cut, \
+         //sphere, //hsphere, //cyl, //hcyl, //pyramid, //hpyramid, //cone, //line, //curve, \
          //paste, //rotate, //flip, //undo, //redo, //size, //clearclipboard, //clearhistory, \
          //expand, //contract, //shift, //outset, //inset, //count, //walls, //faces, //outline, \
          //wand, //schematic (//schem), //brush (//br), //gmask registered.",

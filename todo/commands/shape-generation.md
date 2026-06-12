@@ -30,7 +30,7 @@ centers them on the placement position (the player's position by default, or
 
 ## API Capability
 
-See [README.md's capability table](README.md#quick-reference-pumpkin-api-capability-summary).
+See [README.md's capability table](README.md#quick-reference-pumpkin-api-capability-summary).cla
 Fully implementable today. All of these reduce to "for each `BlockPos` in a
 computed shape, evaluate a `BlockPattern` and call `world.set-block-states`" -
 exactly the machinery `src/commands/set.rs` and `src/commands/shell.rs`

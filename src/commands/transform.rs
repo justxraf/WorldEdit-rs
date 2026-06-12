@@ -10,11 +10,9 @@ use pumpkin_plugin_api::{
 
 use crate::selection::{self, Direction, Region};
 
-use super::{command_names, player_key};
+use super::{MAX_BUILD_Y, MIN_BUILD_Y, command_names, player_key};
 
 const MAX_AMOUNT: i32 = 1_000_000;
-const MIN_BUILD_Y: i32 = -64;
-const MAX_BUILD_Y: i32 = 319;
 
 pub fn register(context: &Context) {
     register_expand(context);
