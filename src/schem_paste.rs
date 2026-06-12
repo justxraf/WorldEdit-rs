@@ -50,9 +50,11 @@ impl Default for PasteOptions {
     fn default() -> Self {
         Self {
             overwrite_with_air: false,
-            // Keep bulk schematic pastes quiet while allowing Pumpkin to
-            // create and remove block entities for container blocks.
-            flags: BlockFlags::SKIP_DROPS | BlockFlags::FORCE_STATE,
+            // This state-only helper cannot restore block-entity payloads, so
+            // preserve exact copied states without running placement logic.
+            flags: BlockFlags::SKIP_DROPS
+                | BlockFlags::FORCE_STATE
+                | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK,
         }
     }
 }

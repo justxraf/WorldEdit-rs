@@ -496,6 +496,14 @@ pub fn palette_key_for_state_id(state_id: u16) -> String {
     "minecraft:air".to_string()
 }
 
+/// Whether this state requires a backing block entity to function/render.
+pub fn state_has_block_entity(state_id: u16) -> bool {
+    STATE_HAS_BLOCK_ENTITY
+        .get(state_id as usize)
+        .copied()
+        .unwrap_or(false)
+}
+
 /// Turn `"minecraft:grass_block"` (or `"grass_block"`) into `"Grass Block"`:
 /// strip the namespace, replace underscores with spaces, and title-case each
 /// word.
@@ -687,6 +695,15 @@ mod tests {
             state_id_for(&palette_key_for_state_id(stone_id)),
             Some(stone_id)
         );
+    }
+
+    #[test]
+    fn block_entity_metadata_distinguishes_chests_from_doors() {
+        let chest = state_id_for("minecraft:chest").unwrap();
+        let door = state_id_for("minecraft:oak_door").unwrap();
+
+        assert!(state_has_block_entity(chest));
+        assert!(!state_has_block_entity(door));
     }
 
     #[test]

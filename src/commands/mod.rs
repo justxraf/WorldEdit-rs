@@ -413,10 +413,11 @@ pub fn require_selection(
 
 /// Block-update flags for bulk edits: force the state and skip normal drops.
 ///
-/// Block-added and block-entity replacement callbacks must still run. Pumpkin
-/// uses them to create and remove block entities, so suppressing them leaves
-/// pasted containers (including chests) without a backing block entity and
-/// replaced containers with stale block entities.
+/// Block-entity replacement callbacks must still run so replaced containers do
+/// not leave stale entities. [`crate::block_data`] selectively suppresses the
+/// block-added callback for ordinary states, preserving exact clipboard states
+/// for doors and other multi-block structures, while allowing it for states
+/// that need Pumpkin to create a block entity.
 ///
 /// FAWE exposes this as the "side effects" / `-n` toggle on commands like
 /// `//set` and `//paste`. WorldEdit-rs currently uses quiet bulk-edit flags

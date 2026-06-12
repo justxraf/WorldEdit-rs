@@ -8,6 +8,8 @@ use pumpkin_plugin_api::{
     world::{BlockChange, BlockFlags, World},
 };
 
+use crate::mapping;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockPlacement {
     pub state_id: u16,
@@ -225,20 +227,42 @@ pub fn capture_block(world: &World, pos: BlockPos) -> BlockPlacement {
 }
 
 pub fn apply_block(world: &World, pos: BlockPos, placement: &BlockPlacement, flags: BlockFlags) {
+    let flags = flags_for_state(placement.state_id, flags);
     world.set_block_state(pos, placement.state_id, flags);
     apply_block_entity(world, pos, placement);
 }
 
+fn flags_for_state(state_id: u16, flags: BlockFlags) -> BlockFlags {
+    if mapping::state_has_block_entity(state_id) {
+        flags
+    } else {
+        flags | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
+    }
+}
+
 pub fn apply_blocks(world: &World, changes: &[(BlockPos, BlockPlacement)], flags: BlockFlags) {
-    let states: Vec<BlockChange> = changes
-        .iter()
-        .map(|(pos, placement)| BlockChange {
+    let mut regular_states = Vec::with_capacity(changes.len());
+    let mut block_entity_states = Vec::new();
+    for (pos, placement) in changes {
+        let change = BlockChange {
             pos: *pos,
             state: placement.state_id,
-        })
-        .collect();
-    if !states.is_empty() {
-        world.set_block_states(&states, flags);
+        };
+        if mapping::state_has_block_entity(placement.state_id) {
+            block_entity_states.push(change);
+        } else {
+            regular_states.push(change);
+        }
+    }
+
+    if !regular_states.is_empty() {
+        world.set_block_states(
+            &regular_states,
+            flags | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK,
+        );
+    }
+    if !block_entity_states.is_empty() {
+        world.set_block_states(&block_entity_states, flags);
     }
 
     for (pos, placement) in changes {
@@ -292,5 +316,23 @@ fn text_from_face(face: &SignFace) -> SignText {
         messages: face.messages.iter().cloned().collect(),
         color: face.color.into(),
         has_glowing_text: face.glowing,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_callbacks_run_only_for_block_entity_states() {
+        let base = BlockFlags::SKIP_DROPS | BlockFlags::FORCE_STATE;
+        let door = mapping::state_id_for("minecraft:oak_door").unwrap();
+        let chest = mapping::state_id_for("minecraft:chest").unwrap();
+
+        assert_eq!(
+            flags_for_state(door, base),
+            base | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
+        );
+        assert_eq!(flags_for_state(chest, base), base);
     }
 }
