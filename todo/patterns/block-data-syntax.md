@@ -1,0 +1,27 @@
+# TODO: Block Data And Special Syntax
+
+## Syntax
+
+- [ ] Block NBT/SNBT, for example `oak_sign{'is_waxed':1}`
+- [ ] Combined states plus NBT, for example `oak_sign[rotation=12]{'is_waxed':1}`
+- [ ] Sign text syntax, for example `oak_sign|Line1|Line2`
+- [ ] Player head syntax, for example `player_head|dinnerbone`
+- [ ] Mob spawner syntax, for example `spawner|squid`
+
+## Why It Is Missing
+
+The current engine resolves to Pumpkin global block-state ids only. These syntax
+forms need block entity data and sometimes entity type or profile lookup support.
+
+## Implementation Notes
+
+- [ ] Extend the edit pipeline to carry block entity payloads alongside state ids.
+- [ ] Parse SNBT with a structured parser rather than ad hoc string splitting.
+- [ ] Decide how to store and undo block entity changes in history.
+- [ ] Add sign text serialization compatible with the target Minecraft version.
+- [ ] Add player profile resolution or document that only raw profile data is
+      supported.
+- [ ] Add spawner entity-id validation.
+- [ ] Add tests for parser ordering: block states before NBT, pipe syntax after
+      block id, and quoted text with spaces.
+
