@@ -110,6 +110,16 @@ pub enum ClipboardPatternKind {
     FullCopy,
 }
 
+impl ClipboardPatternKind {
+    fn source_name(self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::Copy => "copied",
+            Self::FullCopy => "full-copy",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PatternEvalContext {
     origin: BlockPos,
@@ -355,12 +365,13 @@ impl BlockPattern {
             | Self::Existing
             | Self::RandomStates { .. }
             | Self::StateApply { .. } => Ok(()),
-            Self::Clipboard { input, .. } => {
+            Self::Clipboard { input, kind, .. } => {
                 if ctx.clipboard.is_some() {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Pattern '{input}' requires a non-empty clipboard. Use //copy first."
+                        "Pattern '{input}' requires a non-empty {} clipboard. Use //copy first.",
+                        kind.source_name()
                     ))
                 }
             }
