@@ -3,6 +3,8 @@ use std::array;
 use pumpkin_plugin_api::{
     block_entity::{BlockEntityType, DyeColor, SignText},
     common::BlockPos,
+    data_components::DataComponent,
+    player::ItemStack,
     world::{BlockChange, BlockFlags, World},
 };
 
@@ -30,6 +32,25 @@ impl Default for BlockPlacement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockEntityData {
     Sign(SignBlockData),
+    Chest(ChestBlockData),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChestBlockData {
+    pub items: Vec<Option<ItemStackData>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemStackData {
+    pub registry_key: String,
+    pub count: u8,
+    pub components: Vec<ItemComponentData>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemComponentData {
+    pub component: DataComponent,
+    pub value: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +197,25 @@ pub fn capture_block(world: &World, pos: BlockPos) -> BlockPlacement {
                 waxed: sign.is_waxed(),
             }))
         }
+        Some(BlockEntityType::ChestBlockEntity(chest)) => {
+            let items = (0..chest.size())
+                .map(|slot| {
+                    chest.get_item(slot).map(|item| ItemStackData {
+                        registry_key: item.get_registry_key(),
+                        count: item.get_count(),
+                        components: item
+                            .get_components()
+                            .into_iter()
+                            .map(|component| ItemComponentData {
+                                component: component.component,
+                                value: component.value,
+                            })
+                            .collect(),
+                    })
+                })
+                .collect();
+            Some(BlockEntityData::Chest(ChestBlockData { items }))
+        }
         _ => None,
     };
     BlockPlacement {
@@ -215,6 +255,20 @@ fn apply_block_entity(world: &World, pos: BlockPos, placement: &BlockPlacement) 
                 sign.set_front_text(&front);
                 sign.set_back_text(&back);
                 sign.set_waxed(data.waxed);
+            }
+        }
+        Some(BlockEntityData::Chest(data)) => {
+            if let Some(BlockEntityType::ChestBlockEntity(chest)) = world.get_block_entity(pos) {
+                for (slot, item) in data.items.iter().enumerate() {
+                    let item = item.as_ref().map(|data| {
+                        let item = ItemStack::new(&data.registry_key, data.count);
+                        for component in &data.components {
+                            item.set_component(component.component, &component.value);
+                        }
+                        item
+                    });
+                    chest.set_item(slot as u32, item);
+                }
             }
         }
         None => {}

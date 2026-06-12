@@ -35,7 +35,7 @@ pub struct EditChange {
 /// One undoable edit: for every changed block, its state before and after.
 #[derive(Default, Clone)]
 pub struct EditEntry {
-    /// Full before/after placements, including sign payloads when present.
+    /// Full before/after placements, including supported block-entity payloads.
     pub changes: Vec<EditChange>,
 }
 

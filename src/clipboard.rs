@@ -2,14 +2,15 @@
 //!
 //! `//copy` captures every block in the current selection, recording each as
 //! a position offset relative to the player's position at copy time plus its
-//! state id. `//paste` re-applies those offsets relative to the player's
-//! position at paste time.
+//! state id and supported block-entity payload. `//paste` re-applies those
+//! offsets relative to the player's position at paste time.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pumpkin_plugin_api::{common::BlockPos, world::World};
 
+use crate::block_data::{self, BlockEntityData};
 use crate::mapping;
 use crate::schematic::Schematic;
 use crate::selection::Region;
@@ -20,12 +21,12 @@ use crate::transform::Transform;
 /// [`crate::schematic::write`].
 pub type SchematicBlocks = (u16, u16, u16, [i32; 3], Vec<String>);
 
-/// A captured region: each entry is `((dx, dy, dz), state_id)` relative to the
-/// origin position passed to [`capture`].
+/// A captured region with block states and supported block-entity payloads.
 #[derive(Clone)]
 pub struct ClipboardBuffer {
     pub origin: BlockPos,
     pub blocks: Vec<((i32, i32, i32), u16)>,
+    pub block_entities: Vec<((i32, i32, i32), BlockEntityData)>,
 }
 
 impl Default for ClipboardBuffer {
@@ -33,6 +34,7 @@ impl Default for ClipboardBuffer {
         Self {
             origin: BlockPos { x: 0, y: 0, z: 0 },
             blocks: Vec::new(),
+            block_entities: Vec::new(),
         }
     }
 }
@@ -67,10 +69,22 @@ impl ClipboardBuffer {
                 )
             })
             .collect();
+        let block_entities = self
+            .block_entities
+            .iter()
+            .map(|(offset, data)| (transform.apply(*offset), data.clone()))
+            .collect();
         ClipboardBuffer {
             origin: self.origin,
             blocks,
+            block_entities,
         }
+    }
+
+    pub fn block_entity_at(&self, offset: (i32, i32, i32)) -> Option<&BlockEntityData> {
+        self.block_entities
+            .iter()
+            .find_map(|(candidate, data)| (*candidate == offset).then_some(data))
     }
 
     pub fn target_region(&self, paste_origin: BlockPos, include_air: bool) -> Option<Region> {
@@ -177,6 +191,7 @@ pub fn from_schematic(schematic: &Schematic) -> ClipboardBuffer {
     ClipboardBuffer {
         origin: BlockPos { x: 0, y: 0, z: 0 },
         blocks,
+        block_entities: Vec::new(),
     }
 }
 
@@ -201,19 +216,27 @@ pub fn capture_filtered(
     mut include: impl FnMut(u16) -> bool,
 ) -> ClipboardBuffer {
     let mut blocks = Vec::with_capacity(region.volume());
+    let mut block_entities = Vec::new();
     for y in region.min.y..=region.max.y {
         for z in region.min.z..=region.max.z {
             for x in region.min.x..=region.max.x {
                 let pos = BlockPos { x, y, z };
-                let mut state = world.get_block_state_id(pos);
+                let placement = block_data::capture_block(world, pos);
+                let mut state = placement.state_id;
                 if !include(state) {
                     state = 0;
+                } else if let Some(block_entity) = placement.block_entity {
+                    block_entities.push(((x - origin.x, y - origin.y, z - origin.z), block_entity));
                 }
                 blocks.push(((x - origin.x, y - origin.y, z - origin.z), state));
             }
         }
     }
-    ClipboardBuffer { origin, blocks }
+    ClipboardBuffer {
+        origin,
+        blocks,
+        block_entities,
+    }
 }
 
 thread_local! {
@@ -266,6 +289,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(10, 20, 30),
             blocks: vec![((1, 0, 0), 1), ((0, 0, 2), 2)],
+            block_entities: Vec::new(),
         };
         let out = buffer.transformed(crate::transform::Transform::identity());
         assert_eq!(out.blocks, buffer.blocks);
@@ -279,6 +303,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(0, 0, 0),
             blocks: vec![((1, 0, 0), 1), ((0, 0, -1), 2)],
+            block_entities: Vec::new(),
         };
         let rotated = buffer.transformed(Transform::rotate_y(90).unwrap());
         // east (1,0,0) -> south (0,0,1); north (0,0,-1) -> east (1,0,0).
@@ -292,10 +317,33 @@ mod tests {
     }
 
     #[test]
+    fn transformed_rotates_block_entity_offsets() {
+        use crate::block_data::{BlockEntityData, ChestBlockData};
+        use crate::transform::Transform;
+
+        let buffer = ClipboardBuffer {
+            origin: at(0, 0, 0),
+            blocks: vec![((1, 0, 0), 1)],
+            block_entities: vec![(
+                (1, 0, 0),
+                BlockEntityData::Chest(ChestBlockData { items: Vec::new() }),
+            )],
+        };
+
+        let rotated = buffer.transformed(Transform::rotate_y(90).unwrap());
+        assert!(matches!(
+            rotated.block_entity_at((0, 0, 1)),
+            Some(BlockEntityData::Chest(_))
+        ));
+        assert!(rotated.block_entity_at((1, 0, 0)).is_none());
+    }
+
+    #[test]
     fn target_region_uses_offsets_relative_to_paste_origin() {
         let buffer = ClipboardBuffer {
             origin: at(10, 20, 30),
             blocks: vec![((0, 0, 0), 1), ((2, 3, -1), 2)],
+            block_entities: Vec::new(),
         };
         let region = buffer.target_region(at(100, 50, -10), true).unwrap();
         assert_eq!((region.min.x, region.min.y, region.min.z), (100, 50, -11));
@@ -307,6 +355,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(10, 20, 30),
             blocks: vec![((0, 0, 0), 1), ((2, 3, -1), 2)],
+            block_entities: Vec::new(),
         };
         let region = buffer.bounds(true).unwrap();
         assert_eq!((region.min.x, region.min.y, region.min.z), (10, 20, 29));
@@ -318,6 +367,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(0, 0, 0),
             blocks: vec![((0, 0, 0), 0), ((1, 0, 0), 1)],
+            block_entities: Vec::new(),
         };
         let region = buffer.target_region(at(5, 5, 5), false).unwrap();
         assert_eq!((region.min.x, region.max.x), (6, 6));
@@ -328,6 +378,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(0, 0, 0),
             blocks: vec![((0, 0, 0), 0)],
+            block_entities: Vec::new(),
         };
         assert!(buffer.target_region(at(0, 0, 0), false).is_none());
     }
@@ -340,6 +391,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 1)],
+                block_entities: Vec::new(),
             },
         );
         assert!(get(key).is_some());
@@ -356,6 +408,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 1)],
+                block_entities: Vec::new(),
             },
         );
         let (_buffer, transform) = get_with_transform(key).unwrap();
@@ -372,6 +425,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 1)],
+                block_entities: Vec::new(),
             },
         );
         set_transform(key, Transform::rotate_y(90).unwrap());
@@ -386,6 +440,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(0, 0, 0),
             blocks: vec![((0, 0, 0), 1), ((1, 0, 0), 10)],
+            block_entities: Vec::new(),
         };
         let (width, height, length, offset, blocks) = buffer.to_schematic_blocks().unwrap();
         assert_eq!((width, height, length), (2, 1, 1));
@@ -398,6 +453,7 @@ mod tests {
         let buffer = ClipboardBuffer {
             origin: at(10, 20, 30),
             blocks: vec![((0, 0, 0), 1), ((-1, 0, 0), 10)],
+            block_entities: Vec::new(),
         };
         let (_, _, _, offset, _) = buffer.to_schematic_blocks().unwrap();
         // min corner is at origin + (-1,0,0), so Offset = min - origin = (-1,0,0).

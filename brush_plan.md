@@ -65,16 +65,16 @@ Priority: P1. Focus on brushes that fit Pumpkin's existing world/block model.
 
 Priority: P2. Implement only where the block API is sufficient; otherwise recognize and fail clearly.
 
-- [ ] Scatter: random pattern placement within a brush volume.
-- [ ] ScatterOverlay: scatter constrained to surface hits.
-- [ ] ScatterCommand: limited command execution at brush targets, gated behind explicit permission and safety checks.
-- [ ] SurfaceSpline / Spline / Sweep / Catenary: multi-click curve brushes with per-player temporary control point state.
-- [ ] Shatter: fracture terrain using seeded partitioning/noise.
-- [ ] Command brush: targeted command execution with strict allowlist or server permission gating.
+- [x] Scatter: random pattern placement within a brush volume.
+- [x] ScatterOverlay: scatter constrained to surface hits (one block above the surface).
+- [ ] ScatterCommand: limited command execution at brush targets, gated behind explicit permission and safety checks. (Kept recognized-but-unsupported: Pumpkin's plugin API exposes no command-dispatch hook.)
+- [x] SurfaceSpline / Spline / Sweep / Catenary: multi-click curve brushes with per-player temporary control point state.
+- [x] Shatter: fracture terrain using seeded partitioning/noise (Voronoi cell boundaries over scattered surface seeds).
+- [ ] Command brush: targeted command execution with strict allowlist or server permission gating. (Kept recognized-but-unsupported: no plugin command-dispatch hook.)
 - [x] PopulateSchematic: scatter schematic or clipboard placements across valid surfaces (implemented during Phase 2).
-- [ ] Image brush: recognize syntax and return an unsupported message until image loading exists.
-- [ ] BlendBall / Overlay / Surface: implement surface-following block brushes where a solid-top-column model is enough.
-- [ ] Add recognized-but-unsupported handling for entity, biome, feature, and CFI brush families with precise reasons.
+- [x] Image brush: recognize syntax and return an unsupported message until image loading exists (`image` / `stencil`).
+- [x] BlendBall / Overlay / Surface: implement surface-following block brushes where a solid-top-column model is enough.
+- [x] Add recognized-but-unsupported handling for entity, biome, feature, and CFI brush families with precise reasons.
 
 ## Phase 4: Features and polish
 
@@ -97,7 +97,7 @@ Priority: P3. Improve parity, usability, and safety after the block-capable brus
 - [x] 3. Extend parser, literals, and binding state before adding new apply functions.
 - [x] 4. Add shared helpers for targeting, surfaces, scatter, and noise-driven positions.
 - [x] 5. Implement P1 block-capable brushes first: shape parity, clipboard expansion, flatten, terrain tools, height/heightmap.
-- [ ] 6. Implement P2 advanced block-capable brushes: scatter, overlay/surface, spline family, shatter, populate schematic.
+- [x] 6. Implement P2 advanced block-capable brushes: scatter, overlay/surface, spline family, shatter, populate schematic.
 - [x] 7. Add or expand tests for parsing, binding persistence, and apply behavior.
 - [x] 8. Fill out permissions, usage text, and unsupported error messages.
 - [x] 9. Add docstrings and command help text that match the supported FAWE subset accurately.
@@ -151,8 +151,87 @@ Read these before starting Phase 3; the conversation that produced Phase 2 was c
 - Block-state caveat: per-state property variants (e.g. `snow[layers=N]`, stair facings) resolve to default states with the current Pumpkin-style `blocks.json`; write apply paths so they degrade to no-ops rather than wrong blocks, and gate tests like `snow_layer_states_round_trip` does.
 - Run tests with `cargo test --target x86_64-pc-windows-msvc` (the default target is `wasm32-wasip2`, whose test binary cannot execute on Windows). Expect exactly 5 pre-existing failures unrelated to brushes.
 
+## Phase 3 notes (completed 2026-06-12)
+
+Audited against the same local `FastAsyncWorldEdit` checkout as Phase 2. All new
+apply paths reuse the shared helpers called out in the Phase 3 hand-off.
+
+What was implemented (all in `src/commands/brush.rs`):
+
+- [x] Scatter / ScatterOverlay: `apply_scatter` wires `scatter_surface_hits`
+  (deterministic spaced sampling) to the surface scan. Scatter replaces the
+  surface block; the `-o` overlay variant places the pattern one block above
+  it. Honors brush mask + gmask and pushes history.
+- [x] BlendBall (`apply_blendball`): samples the 26 neighbors, replaces the
+  center with the most common neighbor state only when its frequency beats the
+  center's by at least `min_frequency_diff`. `-a` collapses the vote to
+  air-vs-solid. New helpers: `blendball_neighbor_states`, `most_common_with_count`.
+- [x] Surface (`apply_surface`): applies the pattern to every air-exposed block
+  in the sphere (`is_air_exposed` 6-face check). Overlay (`apply_overlay`):
+  places the pattern one block above the top solid block of each column in the disc.
+- [x] Shatter (`apply_shatter`): scatters `count` seeds on the surface, assigns
+  each surface column to its nearest seed (Voronoi), and applies the pattern on
+  columns that border a different cell (4-neighbor boundary test). Seeds are
+  deterministic via `scatter_surface_hits` → `position_hash`.
+- [x] Curve family (spline / surfacespline / catenary / sweep): multi-click
+  control points live in `PlayerBrushes::control_points` keyed by the bound
+  item. `trigger_curve_brush` intercepts these before `apply_brush`: each click
+  adds a point; splines finalize when the same block is clicked twice (FAWE
+  rule), catenary/sweep finalize on the second distinct click. Rebinding or
+  unbinding clears the points. Spline uses a Catmull-Rom curve (`spline_curve`);
+  surface spline projects to XZ and re-snaps Y to `top_solid_in_column`;
+  catenary hangs a parabolic-approximation sag between two points
+  (`catenary_curve`); sweep pastes the clipboard along the two-point line
+  (`apply_sweep`). Local `line_block_samples` (3D Bresenham) keeps the module
+  decoupled from `generation.rs`.
+- [x] Command / ScatterCommand: confirmed `pumpkin-plugin-api` exposes no
+  command-dispatch hook for plugins (only handler registration via
+  `CommandNode::execute`). Kept recognized-but-unsupported with a precise
+  reason naming the missing hook, in both the parser and the apply path.
+- [x] Image / stencil: already recognized-but-unsupported (no image loading).
+- [x] Tests: pure-helper coverage for `most_common_with_count`,
+  `blendball_neighbor_states`, `line_block_samples`, `spline_curve` (incl. flat
+  surface-spline mode and 2-point fallback), `catenary_curve` (sag + taut),
+  `is_curve_brush` / `curve_required_points`, shatter Voronoi nearest-seed, and
+  command-brush parsing. Native-target run (`cargo test --target
+  x86_64-pc-windows-msvc`): 197 passed; the same 5 pre-existing failures the
+  Phase 2 notes document (mapping/pattern/transform per-state-variant tests that
+  need a mojang-style `blocks.json`) remain and are unrelated to brushes.
+
+Intentional deviations from FAWE:
+
+- Spline uses a uniform Catmull-Rom interpolation rather than FAWE's
+  Kochanek–Bartels spline with tension/bias/continuity; the surface-spline TBC
+  and `quality` arguments are still parsed and stored but not yet fed into the
+  curve sampler.
+- Catenary uses a parabolic sag approximation (`4·sag·t·(1−t)`) scaled by
+  `length_factor` instead of solving the true hyperbolic-cosine catenary; the
+  `-h` shell, `-s` select, and `-d` facing-direction flags are parsed/stored but
+  not yet applied.
+- Sweep spaces `copies` clipboard pastes evenly along the straight two-click
+  line (no curved sweep path yet); `copies < 1` pastes once per block on the line.
+- Surface/overlay/scatter/shatter derive any randomness from position hashes
+  (not `ThreadLocalRandom`) so repeated clicks reproduce for undo/tests, matching
+  the Phase 2 determinism convention.
+
+## Phase 4 hand-off notes (for the next session)
+
+- Remaining Phase 4 work is parity/usability polish, not new block brushes:
+  feed surface-spline TBC + `quality` into a Kochanek–Bartels sampler, apply the
+  catenary `-h/-s/-d` flags, add real visualization for `/br vis`, wire scroll
+  actions to actual wheel events (if the event API exposes them — none was used
+  yet), honor target modes 1–3 in the raycast (currently only mode 0 / block
+  range is used by `entity.raycast`), and add persistent per-player brush
+  save/load if plugin storage appears.
+- The curve control-point store (`PlayerBrushes::control_points`) is per
+  `(player name, item slot+id)`; it is cleared on rebind/unbind but NOT on
+  player disconnect — if a leak matters later, clear it from a quit event.
+- Command-dispatch is still the one hard blocker for command/scattercommand
+  brushes; re-check `pumpkin-plugin-api` for a dispatch/run-command API before
+  attempting them again.
+
 ## Notes for future passes
 
-- [ ] Keep unsupported brushes recognized instead of silently ignored.
-- [ ] Prefer deterministic seeded behavior for splatter, shatter, scatter, and noise-backed brushes so undo/tests stay predictable.
-- [ ] Avoid implementing misleading partial support for entity, biome, image, expression, or CFI brushes without explicit user-facing warnings.
+- [x] Keep unsupported brushes recognized instead of silently ignored.
+- [x] Prefer deterministic seeded behavior for splatter, shatter, scatter, and noise-backed brushes so undo/tests stay predictable.
+- [x] Avoid implementing misleading partial support for entity, biome, image, expression, or CFI brushes without explicit user-facing warnings.

@@ -1413,7 +1413,7 @@ fn apply_literal_snbt(
 fn sign_data_from_placement(placement: &BlockPlacement) -> SignBlockData {
     match &placement.block_entity {
         Some(BlockEntityData::Sign(sign)) => sign.clone(),
-        None => SignBlockData::default(),
+        _ => SignBlockData::default(),
     }
 }
 
@@ -2467,6 +2467,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 1), ((1, 0, 0), 10)],
+                block_entities: Vec::new(),
             },
         );
         pattern.validate(&ctx).unwrap();
@@ -2483,6 +2484,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((-1, 0, 0), 1), ((0, 0, 0), 10)],
+                block_entities: Vec::new(),
             },
         );
         assert_eq!(pattern.state_at_with(at(100, 64, 100), 0, &ctx), 1);
@@ -2497,6 +2499,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 1), ((1, 0, 0), 10)],
+                block_entities: Vec::new(),
             },
         );
         assert_eq!(pattern.state_at_with(at(7, 8, 9), 0, &ctx), 10);
@@ -2511,6 +2514,7 @@ mod tests {
             ClipboardBuffer {
                 origin: at(0, 0, 0),
                 blocks: vec![((0, 0, 0), 0), ((1, 0, 0), 10)],
+                block_entities: Vec::new(),
             },
         );
         assert_eq!(pattern.state_at_with(at(0, 0, 0), 99, &ctx), 0);

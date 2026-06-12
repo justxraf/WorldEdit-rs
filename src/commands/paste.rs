@@ -4,8 +4,8 @@
 //! captured cell, including air, overwrites the destination. Supported flags
 //! are `-a` (skip air), `-o` (paste at the original copy origin), `-s` (select
 //! the pasted region), and `-n` (select only, without writing blocks).
-//! Entity/biome flags are intentionally rejected because this clipboard stores
-//! block states only.
+//! Non-block entities and biome flags are intentionally rejected; supported
+//! block entities are carried with their block states.
 
 use pumpkin_plugin_api::{
     Context,
@@ -14,10 +14,14 @@ use pumpkin_plugin_api::{
     common::BlockPos,
     logging::{self, LogLevel},
     text::TextComponent,
-    world::BlockChange,
 };
 
-use crate::{clipboard, history, history::EditEntry, mapping, selection};
+use crate::{
+    block_data::{self, BlockPlacement},
+    clipboard, history,
+    history::EditEntry,
+    mapping, selection,
+};
 
 use super::{batch_size, block_flags, command_names, passes_gmask, player_key, sender_block_pos};
 
@@ -155,7 +159,7 @@ impl pumpkin_plugin_api::commands::CommandHandler for PasteCommand {
             .then(|| mapping::resolve_block("minecraft:structure_void"))
             .flatten();
         for batch in buffer.blocks.chunks(batch_size()) {
-            let mut changes: Vec<BlockChange> = Vec::with_capacity(batch.len());
+            let mut changes: Vec<(BlockPos, BlockPlacement)> = Vec::with_capacity(batch.len());
             for &(offset, state) in batch {
                 if flags.skip_air && state == 0 {
                     continue;
@@ -168,19 +172,23 @@ impl pumpkin_plugin_api::commands::CommandHandler for PasteCommand {
                     y: paste_origin.y + offset.1,
                     z: paste_origin.z + offset.2,
                 };
-                let before = world.get_block_state_id(target);
-                if !passes_gmask(&key, before) {
+                let before = block_data::capture_block(&world, target);
+                if !passes_gmask(&key, before.state_id) {
                     continue;
                 }
-                if before == state {
+                let placement = BlockPlacement {
+                    state_id: state,
+                    block_entity: buffer.block_entity_at(offset).cloned(),
+                };
+                if before == placement {
                     continue;
                 }
-                entry.push_state_change(target, before, state);
-                changes.push(BlockChange { pos: target, state });
+                entry.push_change(target, before, placement.clone());
+                changes.push((target, placement));
             }
             placed += changes.len();
             if !changes.is_empty() {
-                world.set_block_states(&changes, block_flags());
+                block_data::apply_blocks(&world, &changes, block_flags());
             }
         }
         history::push(&key, entry);

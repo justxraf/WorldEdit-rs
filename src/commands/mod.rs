@@ -411,17 +411,18 @@ pub fn require_selection(
     }
 }
 
-/// Block-update flags for bulk edits: force the state, skip drops, and skip
-/// per-block callbacks/physics to keep large operations quiet and fast.
+/// Block-update flags for bulk edits: force the state and skip normal drops.
+///
+/// Block-added and block-entity replacement callbacks must still run. Pumpkin
+/// uses them to create and remove block entities, so suppressing them leaves
+/// pasted containers (including chests) without a backing block entity and
+/// replaced containers with stale block entities.
 ///
 /// FAWE exposes this as the "side effects" / `-n` toggle on commands like
 /// `//set` and `//paste`. WorldEdit-rs currently uses quiet bulk-edit flags
 /// globally; `//set -n` is accepted for command compatibility.
 pub fn block_flags() -> BlockFlags {
-    BlockFlags::SKIP_DROPS
-        | BlockFlags::FORCE_STATE
-        | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
-        | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK
+    BlockFlags::SKIP_DROPS | BlockFlags::FORCE_STATE
 }
 
 /// Sender's current block position, or an error message if unavailable.
@@ -455,4 +456,17 @@ pub fn batch_size() -> usize {
 /// whatever mask the command itself applies.
 pub fn passes_gmask(key: &str, before: u16) -> bool {
     mask::passes(key, before)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_edit_flags_preserve_block_entity_callbacks() {
+        assert_eq!(
+            block_flags(),
+            BlockFlags::SKIP_DROPS | BlockFlags::FORCE_STATE
+        );
+    }
 }

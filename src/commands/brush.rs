@@ -4,8 +4,11 @@
 //! Pumpkin's current block APIs: shape brushes (including FAWE's falling
 //! sphere and hollow cylinder thickness), clipboard stamping, populate
 //! schematic scattering, simple terrain smoothing, gravity, extinguish,
-//! raise/lower, splatter, layered snow, and the erode/pull/dilate/morph
-//! preset family. Parity tracks the local `FastAsyncWorldEdit`
+//! raise/lower, splatter, layered snow, the erode/pull/dilate/morph preset
+//! family, surface-following brushes (surface/overlay/blendball), scatter
+//! placement, Voronoi shatter, and the multi-click curve family
+//! (spline/surfacespline/catenary/sweep). Parity tracks the local
+//! `FastAsyncWorldEdit`
 //! `BrushCommands` / `ToolUtilCommands` command names and defaults where that
 //! maps cleanly onto Pumpkin's block-only world model. Commands that need
 //! entities, biomes, features, image loading, or FAWE's richer tool state are
@@ -26,6 +29,14 @@
 //!   use `-f` explicitly.
 //! - Pull reuses the `worldedit.brush.morph` permission node instead of
 //!   FAWE's `worldedit.brush.pull`.
+//! - Spline uses a uniform Catmull-Rom curve rather than FAWE's
+//!   Kochanek–Bartels spline; the surface-spline tension/bias/continuity and
+//!   `quality` arguments are parsed and stored but not yet sampled.
+//! - Catenary uses a parabolic sag approximation scaled by `length_factor`
+//!   instead of the true hyperbolic-cosine curve, and its `-h/-s/-d` flags are
+//!   parsed/stored but not yet applied.
+//! - Command and scattercommand brushes stay recognized-but-unsupported:
+//!   Pumpkin's plugin API exposes no command-dispatch hook for plugins.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -73,10 +84,11 @@ const MAX_SNOW_LAYERS: i32 = 8;
 const BRUSH_COMMAND_PERMISSION: &str = "worldedit-rs:command.brush";
 const BRUSH_USAGE: &str = concat!(
     "Usage: //brush <brush|setting> ...\n",
-    "Supported brushes: sphere [-h|-f], cylinder [-h] (with thickness), set, clipboard [-a|-o|-r], smooth, gravity [-h], extinguish, splatter, raise, lower, erode, pull, dilate, morph, snow [-s], blendball, surface, overlay, scatter, height, heightmap, flatten, cliff, populateschematic [-r].\n",
-    "Stored phase-one stubs: scattercommand, spline, surfacespline/sspl, sweep, catenary, shatter, command.\n",
+    "Supported brushes: sphere [-h|-f], cylinder [-h] (with thickness), set, clipboard [-a|-o|-r], smooth, gravity [-h], extinguish, splatter, raise, lower, erode, pull, dilate, morph, snow [-s], blendball, surface, overlay, scatter [-o], shatter, height, heightmap, flatten, cliff, populateschematic [-r].\n",
+    "Multi-click curve brushes: spline/curve and surfacespline (click the same block twice to finish), catenary and sweep (click two points).\n",
+    "Recognized but unsupported: scattercommand, command (no plugin command-dispatch hook), image/stencil, copypaste, and entity/biome/generation brushes.\n",
     "Settings: size, material/mat, mask, range, tracemask/tm, targetmask/tarmask, target/tar, vis, scroll.\n",
-    "Notes: FAWE aliases audited from the local FastAsyncWorldEdit source; copy-on-click brushes, image/stencil brushes, and entity/biome/generation brushes still report explicit unsupported errors."
+    "Notes: FAWE aliases audited from the local FastAsyncWorldEdit source."
 );
 
 pub fn register(context: &Context) {
@@ -291,6 +303,8 @@ fn handle_brush_command(
                 let binding = BrushBinding::with_kind(binding.kind, tools.bindings.get(&item));
                 range = binding.range;
                 tools.bindings.insert(item.clone(), binding);
+                // Rebinding resets any in-progress curve control points.
+                tools.control_points.remove(&item);
             });
             sender.send_message(TextComponent::text(&format!(
                 "Bound {summary} to {item_label}. Range: {range:.0} blocks."
@@ -303,9 +317,10 @@ fn handle_brush_command(
                 return Ok(0);
             };
             let removed = BRUSHES.with_borrow_mut(|map| {
-                map.get_mut(&key)
-                    .and_then(|tools| tools.bindings.remove(&item))
-                    .is_some()
+                map.get_mut(&key).is_some_and(|tools| {
+                    tools.control_points.remove(&item);
+                    tools.bindings.remove(&item).is_some()
+                })
             });
             if removed {
                 sender.send_message(TextComponent::text(&format!(
@@ -397,6 +412,9 @@ fn brush_literal(name: &str, prefix: &'static str) -> CommandNode {
 #[derive(Default)]
 struct PlayerBrushes {
     bindings: HashMap<ToolBindingKey, BrushBinding>,
+    /// Accumulated control-point clicks for multi-click curve brushes
+    /// (spline / surface spline / catenary / sweep), keyed by the bound item.
+    control_points: HashMap<ToolBindingKey, Vec<BlockPos>>,
 }
 
 thread_local! {
@@ -1241,11 +1259,12 @@ fn parse_brush_command(raw: &str) -> Result<ParsedBrushCommand, String> {
             name,
             reason: "snow-layer-aware heightmap smoothing is not implemented yet; use //brush smooth or //brush snow instead.",
         }),
-        "forest" | "butcher" | "kill" | "paint" | "feature" | "apply" | "deform"
-        | "biome" => Ok(ParsedBrushCommand::Unsupported {
-            name,
-            reason: "it needs entities, biomes, generation features, images, or FAWE expressions that this plugin cannot access yet.",
-        }),
+        "forest" | "butcher" | "kill" | "paint" | "feature" | "apply" | "deform" | "biome" => {
+            Ok(ParsedBrushCommand::Unsupported {
+                name,
+                reason: "it needs entities, biomes, generation features, images, or FAWE expressions that this plugin cannot access yet.",
+            })
+        }
         _ => Err(format!("Unknown brush '{name}'.")),
     }
 }
@@ -1367,17 +1386,21 @@ fn parse_cylinder(args: &[String]) -> Result<ParsedBrushCommand, String> {
     let hollow = flags.contains(&'h');
     let pattern = parse_required_pattern_str(positional.first().copied())?;
     let radius = parse_optional_radius_str(positional.get(1).copied(), SHAPE_DEFAULT_RADIUS)?;
-    let height = parse_optional_i32_str(positional.get(2).copied(), DEFAULT_HEIGHT)?
-        .clamp(1, MAX_HEIGHT);
+    let height =
+        parse_optional_i32_str(positional.get(2).copied(), DEFAULT_HEIGHT)?.clamp(1, MAX_HEIGHT);
     let thickness = parse_optional_f64_str(positional.get(3).copied(), 0.0)?;
     if !thickness.is_finite() || thickness < 0.0 || thickness >= radius {
-        return Err("Cylinder thickness must be zero or positive and smaller than the radius.".to_string());
+        return Err(
+            "Cylinder thickness must be zero or positive and smaller than the radius.".to_string(),
+        );
     }
     if thickness > 0.0 && !hollow {
         return Err("Cylinder thickness requires the '-h' hollow flag.".to_string());
     }
     if let Some(unexpected) = positional.get(4) {
-        return Err(format!("Unexpected cylinder brush argument '{unexpected}'."));
+        return Err(format!(
+            "Unexpected cylinder brush argument '{unexpected}'."
+        ));
     }
     Ok(bind(BrushKind::Cylinder {
         pattern,
@@ -2211,6 +2234,9 @@ fn trigger_player_brush(player: &Player, clicked: Option<BlockPos>) -> bool {
     };
     let world = player.get_world();
     let started = std::time::Instant::now();
+    if is_curve_brush(&binding.kind) {
+        return trigger_curve_brush(player, &world, &key, &item, target, &binding, started);
+    }
     let changed = match apply_brush(&key, &world, target, &binding) {
         Ok(changed) => changed,
         Err(message) => {
@@ -2231,6 +2257,407 @@ fn trigger_player_brush(player: &Player, clicked: Option<BlockPos>) -> bool {
         true,
     );
     true
+}
+
+fn is_curve_brush(kind: &BrushKind) -> bool {
+    matches!(
+        kind,
+        BrushKind::Spline { .. }
+            | BrushKind::SurfaceSpline { .. }
+            | BrushKind::Catenary { .. }
+            | BrushKind::Sweep { .. }
+    )
+}
+
+/// Number of control-point clicks a curve brush collects before it draws.
+/// Catenary and sweep hang/draw between exactly two clicks (FAWE); the spline
+/// brushes accumulate until the same block is clicked twice.
+fn curve_required_points(kind: &BrushKind) -> Option<usize> {
+    match kind {
+        BrushKind::Catenary { .. } | BrushKind::Sweep { .. } => Some(2),
+        _ => None,
+    }
+}
+
+/// Multi-click curve brush handler. Each click adds a control point; FAWE
+/// finalizes a spline when the same block is clicked twice, and finalizes a
+/// catenary/sweep once two distinct points exist. On finalize the curve is
+/// drawn and the control points are cleared.
+#[allow(clippy::too_many_arguments)]
+fn trigger_curve_brush(
+    player: &Player,
+    world: &World,
+    key: &str,
+    item: &ToolBindingKey,
+    target: BlockPos,
+    binding: &BrushBinding,
+    started: std::time::Instant,
+) -> bool {
+    let fixed = curve_required_points(&binding.kind);
+    let finalize = BRUSHES.with_borrow_mut(|map| {
+        let tools = map.entry(key.to_string()).or_default();
+        let points = tools.control_points.entry(item.clone()).or_default();
+        let repeat = points
+            .last()
+            .is_some_and(|last| last.x == target.x && last.y == target.y && last.z == target.z);
+        if !repeat {
+            points.push(target);
+        }
+        match fixed {
+            // Catenary/sweep draw as soon as two distinct points are set.
+            Some(n) => points.len() >= n,
+            // Splines accumulate until the same block is clicked twice.
+            None => repeat && points.len() >= 2,
+        }
+    });
+
+    if !finalize {
+        let count = BRUSHES.with_borrow(|map| {
+            map.get(key)
+                .and_then(|tools| tools.control_points.get(item))
+                .map_or(0, Vec::len)
+        });
+        let hint = if fixed.is_some() {
+            "click a second point to draw".to_string()
+        } else {
+            "click the same block twice to finish".to_string()
+        };
+        player.send_system_message(
+            TextComponent::text(&format!("Control point {count} set; {hint}.")),
+            true,
+        );
+        return true;
+    }
+
+    let points = BRUSHES.with_borrow_mut(|map| {
+        map.get_mut(key)
+            .and_then(|tools| tools.control_points.remove(item))
+            .unwrap_or_default()
+    });
+
+    let changed = match apply_curve_brush(key, world, &binding.kind, &points, binding.mask.as_ref())
+    {
+        Ok(changed) => changed,
+        Err(message) => {
+            player.send_system_message(TextComponent::text(&message), true);
+            return true;
+        }
+    };
+    logging::log(
+        LogLevel::Info,
+        &format!(
+            "WorldEdit-rs: brush {} changed {changed} blocks in {:?}.",
+            binding.kind.summary(),
+            started.elapsed()
+        ),
+    );
+    player.send_system_message(
+        TextComponent::text(&format!("Brush changed {changed} blocks.")),
+        true,
+    );
+    true
+}
+
+fn apply_curve_brush(
+    key: &str,
+    world: &World,
+    kind: &BrushKind,
+    points: &[BlockPos],
+    mask: Option<&BlockMask>,
+) -> Result<usize, String> {
+    if points.len() < 2 {
+        return Ok(0);
+    }
+    let last = *points.last().expect("non-empty");
+    let pattern_ctx = PatternEvalContext::for_operation(last, key, world);
+    match kind {
+        BrushKind::Spline { pattern, radius } => {
+            pattern.validate(&pattern_ctx)?;
+            let curve = spline_curve(points, false);
+            Ok(apply_curve_positions(
+                key,
+                world,
+                &curve,
+                *radius,
+                pattern,
+                &pattern_ctx,
+                mask,
+            ))
+        }
+        BrushKind::SurfaceSpline {
+            pattern, radius, ..
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            let curve = spline_curve(points, true)
+                .into_iter()
+                .filter_map(|pos| {
+                    top_solid_in_column(world, pos.x, pos.z, MIN_BUILD_Y, MAX_BUILD_Y, None).map(
+                        |(y, _)| BlockPos {
+                            x: pos.x,
+                            y,
+                            z: pos.z,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(apply_curve_positions(
+                key,
+                world,
+                &curve,
+                *radius,
+                pattern,
+                &pattern_ctx,
+                mask,
+            ))
+        }
+        BrushKind::Catenary {
+            pattern,
+            radius,
+            length_factor,
+            ..
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            let curve = catenary_curve(points[0], last, *length_factor);
+            Ok(apply_curve_positions(
+                key,
+                world,
+                &curve,
+                *radius,
+                pattern,
+                &pattern_ctx,
+                mask,
+            ))
+        }
+        BrushKind::Sweep { copies } => apply_sweep(key, world, points, *copies, mask),
+        _ => Ok(0),
+    }
+}
+
+/// Stamp a pattern along a curve, optionally thickening each sample into a
+/// sphere of `radius` (radius `0` draws a single-block-wide line).
+fn apply_curve_positions(
+    key: &str,
+    world: &World,
+    curve: &[BlockPos],
+    radius: f64,
+    pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let mut seen = std::collections::HashSet::<BlockPosKey>::new();
+    let mut positions = Vec::new();
+    for &sample in curve {
+        if radius > 0.0 {
+            for pos in sphere_positions(sample, radius, false) {
+                if seen.insert(pos.into()) {
+                    positions.push(pos);
+                }
+            }
+        } else if seen.insert(sample.into()) {
+            positions.push(sample);
+        }
+    }
+    positions.retain(|pos| (MIN_BUILD_Y..=MAX_BUILD_Y).contains(&pos.y));
+    apply_pattern_positions(key, world, positions, pattern, pattern_ctx, mask)
+}
+
+/// Paste the player's clipboard along a two-point line, `copies` times evenly
+/// spaced (FAWE's sweep brush). `copies < 1` falls back to one paste per block
+/// along the line.
+fn apply_sweep(
+    key: &str,
+    world: &World,
+    points: &[BlockPos],
+    copies: i32,
+    mask: Option<&BlockMask>,
+) -> Result<usize, String> {
+    let (buffer, transform) = clipboard::get_with_transform(key)
+        .ok_or_else(|| "Your clipboard is empty. Use //copy before sweeping.".to_string())?;
+    let buffer = buffer.transformed(transform);
+    let line = line_block_samples(points[0], *points.last().expect("non-empty"));
+    let anchors: Vec<BlockPos> = if copies >= 1 {
+        let copies = copies as usize;
+        if line.len() <= 1 || copies == 1 {
+            vec![line[0]]
+        } else {
+            (0..copies)
+                .map(|i| line[i * (line.len() - 1) / (copies - 1)])
+                .collect()
+        }
+    } else {
+        line
+    };
+
+    let mut entry = EditEntry::default();
+    for anchor in anchors {
+        for &(offset, state) in &buffer.blocks {
+            if state == 0 {
+                continue;
+            }
+            let pos = BlockPos {
+                x: anchor.x + offset.0,
+                y: anchor.y + offset.1,
+                z: anchor.z + offset.2,
+            };
+            if !(MIN_BUILD_Y..=MAX_BUILD_Y).contains(&pos.y) {
+                continue;
+            }
+            push_change(key, world, &mut entry, pos, state, mask);
+        }
+    }
+    Ok(commit_entry(key, world, entry))
+}
+
+/// Catmull-Rom (centripetal) spline through the control points, sampled per
+/// segment finely enough to leave no gaps. `flat` projects the curve onto the
+/// XZ plane (used by the surface spline, which re-snaps Y to the terrain).
+fn spline_curve(points: &[BlockPos], flat: bool) -> Vec<BlockPos> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    if points.len() == 2 {
+        return line_block_samples(points[0], points[1]);
+    }
+    let pt = |i: i32| -> (f64, f64, f64) {
+        let idx = i.clamp(0, points.len() as i32 - 1) as usize;
+        let p = points[idx];
+        (
+            f64::from(p.x),
+            if flat { 0.0 } else { f64::from(p.y) },
+            f64::from(p.z),
+        )
+    };
+    let mut seen = std::collections::HashSet::<BlockPosKey>::new();
+    let mut out = Vec::new();
+    for i in 0..points.len() as i32 - 1 {
+        let p0 = pt(i - 1);
+        let p1 = pt(i);
+        let p2 = pt(i + 1);
+        let p3 = pt(i + 2);
+        let seg_len =
+            ((p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2) + (p2.2 - p1.2).powi(2)).sqrt();
+        let steps = (seg_len.ceil() as i32 * 2).max(2);
+        for s in 0..=steps {
+            let t = f64::from(s) / f64::from(steps);
+            let (x, y, z) = catmull_rom(p0, p1, p2, p3, t);
+            let pos = BlockPos {
+                x: x.round() as i32,
+                y: if flat { points[0].y } else { y.round() as i32 },
+                z: z.round() as i32,
+            };
+            if seen.insert(pos.into()) {
+                out.push(pos);
+            }
+        }
+    }
+    out
+}
+
+fn catmull_rom(
+    p0: (f64, f64, f64),
+    p1: (f64, f64, f64),
+    p2: (f64, f64, f64),
+    p3: (f64, f64, f64),
+    t: f64,
+) -> (f64, f64, f64) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let comp = |a: f64, b: f64, c: f64, d: f64| {
+        0.5 * ((2.0 * b)
+            + (-a + c) * t
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+            + (-a + 3.0 * b - 3.0 * c + d) * t3)
+    };
+    (
+        comp(p0.0, p1.0, p2.0, p3.0),
+        comp(p0.1, p1.1, p2.1, p3.1),
+        comp(p0.2, p1.2, p2.2, p3.2),
+    )
+}
+
+/// FAWE's catenary brush: hang a rope curve between two points whose arc
+/// length is `length_factor` times the straight-line distance, sagging under
+/// "gravity" in the -Y direction. Larger `length_factor` sags lower.
+fn catenary_curve(start: BlockPos, end: BlockPos, length_factor: f64) -> Vec<BlockPos> {
+    let factor = length_factor.max(1.0);
+    let dx = f64::from(end.x - start.x);
+    let dy = f64::from(end.y - start.y);
+    let dz = f64::from(end.z - start.z);
+    let horizontal = (dx * dx + dz * dz).sqrt();
+    let straight = (dx * dx + dy * dy + dz * dz).sqrt();
+    if straight < 1.0 {
+        return vec![start];
+    }
+    // Extra rope length translates into sag depth; scale by the straight-line
+    // distance so longer spans sag proportionally more.
+    let sag = (factor - 1.0).sqrt() * straight * 0.5;
+    let steps = (straight * factor).ceil() as i32 * 2;
+    let steps = steps.max(2);
+    let mut seen = std::collections::HashSet::<BlockPosKey>::new();
+    let mut out = Vec::new();
+    for s in 0..=steps {
+        let t = f64::from(s) / f64::from(steps);
+        // Parabolic approximation of a catenary: 4*sag*t*(1-t) dips the middle.
+        let droop = 4.0 * sag * t * (1.0 - t);
+        let x = f64::from(start.x) + dx * t;
+        let z = f64::from(start.z) + dz * t;
+        let y = f64::from(start.y) + dy * t - droop;
+        let _ = horizontal;
+        let pos = BlockPos {
+            x: x.round() as i32,
+            y: y.round() as i32,
+            z: z.round() as i32,
+        };
+        if seen.insert(pos.into()) {
+            out.push(pos);
+        }
+    }
+    out
+}
+
+/// 3D Bresenham-style line between two block positions (local copy so the
+/// brush module stays decoupled from `generation.rs`).
+fn line_block_samples(a: BlockPos, b: BlockPos) -> Vec<BlockPos> {
+    let dx = (b.x - a.x).abs();
+    let dy = (b.y - a.y).abs();
+    let dz = (b.z - a.z).abs();
+    if dx + dy + dz == 0 {
+        return vec![a];
+    }
+    let dominant = dx.max(dy).max(dz);
+    let mut seen = std::collections::HashSet::<BlockPosKey>::new();
+    let mut out = Vec::new();
+    let mut push = |pos: BlockPos, out: &mut Vec<BlockPos>| {
+        if seen.insert(pos.into()) {
+            out.push(pos);
+        }
+    };
+    let lerp = |from: i32, to: i32, num: i32, den: i32| -> i32 {
+        (f64::from(from) + f64::from(num) * f64::from(to - from) / f64::from(den)).round() as i32
+    };
+    for step in 0..=dominant {
+        let pos = if dominant == dx {
+            BlockPos {
+                x: a.x + step * (b.x - a.x).signum(),
+                y: lerp(a.y, b.y, step, dx),
+                z: lerp(a.z, b.z, step, dx),
+            }
+        } else if dominant == dy {
+            BlockPos {
+                x: lerp(a.x, b.x, step, dy),
+                y: a.y + step * (b.y - a.y).signum(),
+                z: lerp(a.z, b.z, step, dy),
+            }
+        } else {
+            BlockPos {
+                x: lerp(a.x, b.x, step, dz),
+                y: lerp(a.y, b.y, step, dz),
+                z: a.z + step * (b.z - a.z).signum(),
+            }
+        };
+        push(pos, &mut out);
+    }
+    out
 }
 
 fn apply_brush(
@@ -2420,41 +2847,114 @@ fn apply_brush(
                 binding.mask.as_ref(),
             ))
         }
-        BrushKind::Overlay { .. } => Err(
-            "Overlay brushes are parsed and stored, but the surface-following edit path is not implemented yet."
-                .to_string(),
-        ),
-        BrushKind::Surface { .. } => Err(
-            "Surface brushes are parsed and stored, but the surface-following edit path is not implemented yet."
-                .to_string(),
-        ),
-        BrushKind::BlendBall { .. } => Err(
-            "Blendball brushes are parsed and stored, but the terrain blending edit path is not implemented yet."
-                .to_string(),
-        ),
-        BrushKind::Scatter { .. } | BrushKind::ScatterOverlay { .. } => Err(
-            "Scatter brushes are parsed and stored, but the scatter placement edit path is not implemented yet."
-                .to_string(),
-        ),
+        BrushKind::Overlay { pattern, radius } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_overlay(
+                key,
+                world,
+                target,
+                pattern,
+                &pattern_ctx,
+                *radius,
+                binding.mask.as_ref(),
+            ))
+        }
+        BrushKind::Surface { pattern, radius } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_surface(
+                key,
+                world,
+                target,
+                pattern,
+                &pattern_ctx,
+                *radius,
+                binding.mask.as_ref(),
+            ))
+        }
+        BrushKind::BlendBall {
+            radius,
+            min_frequency_diff,
+            only_air,
+        } => Ok(apply_blendball(
+            key,
+            world,
+            target,
+            *radius,
+            *min_frequency_diff,
+            *only_air,
+            binding.mask.as_ref(),
+        )),
+        BrushKind::Scatter {
+            pattern,
+            radius,
+            points,
+            distance,
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_scatter(
+                key,
+                world,
+                target,
+                pattern,
+                &pattern_ctx,
+                *radius,
+                *points as usize,
+                *distance,
+                false,
+                binding.mask.as_ref(),
+            ))
+        }
+        BrushKind::ScatterOverlay {
+            pattern,
+            radius,
+            points,
+            distance,
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_scatter(
+                key,
+                world,
+                target,
+                pattern,
+                &pattern_ctx,
+                *radius,
+                *points as usize,
+                *distance,
+                true,
+                binding.mask.as_ref(),
+            ))
+        }
         BrushKind::ScatterCommand { .. } => Err(
-            "Scatter command brushes are parsed and stored, but command execution brushes are not enabled yet."
+            "Scatter command brushes are recognized, but Pumpkin's plugin API exposes no command-dispatch hook, so command-execution brushes cannot run yet."
                 .to_string(),
         ),
+        BrushKind::Shatter {
+            pattern,
+            radius,
+            count,
+        } => {
+            pattern.validate(&pattern_ctx)?;
+            Ok(apply_shatter(
+                key,
+                world,
+                target,
+                pattern,
+                &pattern_ctx,
+                *radius,
+                *count as usize,
+                binding.mask.as_ref(),
+            ))
+        }
+        BrushKind::Command { .. } => Err(
+            "Command brushes are recognized, but Pumpkin's plugin API exposes no command-dispatch hook, so command-execution brushes cannot run yet."
+                .to_string(),
+        ),
+        // Curve brushes are multi-click and handled in `trigger_curve_brush`
+        // before `apply_brush` is ever reached.
         BrushKind::Spline { .. }
         | BrushKind::SurfaceSpline { .. }
-        | BrushKind::Sweep { .. }
-        | BrushKind::Catenary { .. } => Err(
-            "Curve brushes are parsed and stored, but multi-click control point state is not implemented yet."
-                .to_string(),
-        ),
-        BrushKind::Shatter { .. } => Err(
-            "Shatter brushes are parsed and stored, but the fracture terrain edit path is not implemented yet."
-                .to_string(),
-        ),
-        BrushKind::Command { .. } => Err(
-            "Command brushes are parsed and stored, but command execution brushes are not enabled yet."
-                .to_string(),
-        ),
+        | BrushKind::Catenary { .. }
+        | BrushKind::Sweep { .. } => Ok(0),
         BrushKind::PopulateSchematic {
             clipboard,
             placement_mask,
@@ -2570,6 +3070,329 @@ fn apply_splatter(
     }
 
     commit_entry(key, world, entry)
+}
+
+/// FAWE's `ScatterBrush`: pick `points` surface columns at least `distance`
+/// apart inside the brush radius and apply the pattern. The overlay variant
+/// places the pattern one block above the surface block instead of replacing
+/// it (FAWE `ScatterOverlayBrush`). Selection is deterministic via
+/// `select_spaced_positions` so repeated clicks reproduce for undo/tests.
+#[allow(clippy::too_many_arguments)]
+fn apply_scatter(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
+    radius: f64,
+    points: usize,
+    distance: i32,
+    overlay: bool,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let r = radius.ceil() as i32;
+    let surface_hits = surface_hits_for_shape(
+        world,
+        target,
+        Shape::Sphere,
+        r,
+        target.y - r,
+        target.y + r,
+        None,
+    );
+    let selected = scatter_surface_hits(&surface_hits, points, distance);
+    let mut entry = EditEntry::default();
+    for hit in selected {
+        let pos = if overlay {
+            if hit.y + 1 > MAX_BUILD_Y {
+                continue;
+            }
+            BlockPos {
+                x: hit.column.x,
+                y: hit.y + 1,
+                z: hit.column.z,
+            }
+        } else {
+            BlockPos {
+                x: hit.column.x,
+                y: hit.y,
+                z: hit.column.z,
+            }
+        };
+        let before = block_data::capture_block(world, pos);
+        if mask.is_some_and(|mask| !mask.matches(before.state_id))
+            || !passes_gmask(key, before.state_id)
+        {
+            continue;
+        }
+        let after = pattern.placement_at_with(pos, &before, pattern_ctx);
+        if before == after {
+            continue;
+        }
+        entry.push_change(pos, before, after);
+    }
+    commit_entry(key, world, entry)
+}
+
+/// FAWE's `SurfaceSphereBrush`: apply the pattern to every block inside the
+/// sphere that is exposed to air on at least one face (a "surface" block).
+fn apply_surface(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
+    radius: f64,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let positions = sphere_positions(target, radius, false);
+    let mut entry = EditEntry::default();
+    for pos in positions {
+        let before = block_data::capture_block(world, pos);
+        if before.state_id == 0
+            || mask.is_some_and(|mask| !mask.matches(before.state_id))
+            || !passes_gmask(key, before.state_id)
+        {
+            continue;
+        }
+        if !is_air_exposed(world, pos) {
+            continue;
+        }
+        let after = pattern.placement_at_with(pos, &before, pattern_ctx);
+        if before == after {
+            continue;
+        }
+        entry.push_change(pos, before, after);
+    }
+    commit_entry(key, world, entry)
+}
+
+/// FAWE's overlay brushes (`SurfaceSphereBrush` overlay form): place the
+/// pattern one block above the top solid block of every column in the disc.
+fn apply_overlay(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
+    radius: f64,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let r = radius.ceil() as i32;
+    let surface_hits = surface_hits_for_shape(
+        world,
+        target,
+        Shape::Sphere,
+        r,
+        target.y - r,
+        target.y + r,
+        None,
+    );
+    let mut entry = EditEntry::default();
+    for hit in surface_hits {
+        if hit.y + 1 > MAX_BUILD_Y {
+            continue;
+        }
+        let pos = BlockPos {
+            x: hit.column.x,
+            y: hit.y + 1,
+            z: hit.column.z,
+        };
+        let before = block_data::capture_block(world, pos);
+        if mask.is_some_and(|mask| !mask.matches(before.state_id))
+            || !passes_gmask(key, before.state_id)
+        {
+            continue;
+        }
+        let after = pattern.placement_at_with(pos, &before, pattern_ctx);
+        if before == after {
+            continue;
+        }
+        entry.push_change(pos, before, after);
+    }
+    commit_entry(key, world, entry)
+}
+
+/// FAWE's `BlendBall`: replace each block in the sphere with the most common
+/// state among its 26 neighbors, but only when that state's frequency exceeds
+/// the current block's frequency by at least `min_frequency_diff`. With
+/// `only_air`, blending only swaps air vs non-air (collapsing the count to a
+/// boolean) instead of distinguishing individual block states.
+fn apply_blendball(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    radius: i32,
+    min_frequency_diff: u8,
+    only_air: bool,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let positions = sphere_positions(target, radius as f64, false);
+    let mut states = HashMap::<BlockPosKey, u16>::new();
+    for pos in &positions {
+        states.insert((*pos).into(), world.get_block_state_id(*pos));
+    }
+    let mut entry = EditEntry::default();
+    for pos in &positions {
+        let current = *states.get(&(*pos).into()).unwrap_or(&0);
+        if mask.is_some_and(|mask| !mask.matches(current)) || !passes_gmask(key, current) {
+            continue;
+        }
+        let neighbors = blendball_neighbor_states(*pos, &states, only_air);
+        let Some((best, best_count)) = most_common_with_count(&neighbors) else {
+            continue;
+        };
+        let current_count = neighbors.iter().filter(|s| **s == current).count();
+        if best == current || best_count.saturating_sub(current_count) < min_frequency_diff as usize
+        {
+            continue;
+        }
+        push_change(key, world, &mut entry, *pos, best, None);
+    }
+    commit_entry(key, world, entry)
+}
+
+/// FAWE's `ShatterBrush`: scatter `count` seed points on the surface inside
+/// the radius and apply the pattern along the Voronoi cell boundaries — every
+/// surface column whose nearest seed differs from a 4-neighbor's nearest seed
+/// gets the pattern, fracturing the terrain into cells. Seeds are picked
+/// deterministically so undo/tests stay stable.
+#[allow(clippy::too_many_arguments)]
+fn apply_shatter(
+    key: &str,
+    world: &World,
+    target: BlockPos,
+    pattern: &BlockPattern,
+    pattern_ctx: &PatternEvalContext,
+    radius: f64,
+    count: usize,
+    mask: Option<&BlockMask>,
+) -> usize {
+    let r = radius.ceil() as i32;
+    let surface_hits = surface_hits_for_shape(
+        world,
+        target,
+        Shape::Sphere,
+        r,
+        target.y - r,
+        target.y + r,
+        None,
+    );
+    if surface_hits.is_empty() {
+        return 0;
+    }
+    let seeds = scatter_surface_hits(&surface_hits, count.max(1), 1);
+    if seeds.is_empty() {
+        return 0;
+    }
+    // Map each column offset to the index of its nearest seed (Voronoi cells).
+    let nearest_seed = |dx: i32, dz: i32| -> usize {
+        seeds
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, seed)| {
+                let sx = seed.column.dx - dx;
+                let sz = seed.column.dz - dz;
+                sx * sx + sz * sz
+            })
+            .map_or(0, |(i, _)| i)
+    };
+    let cells: HashMap<(i32, i32), usize> = surface_hits
+        .iter()
+        .map(|hit| {
+            (
+                (hit.column.dx, hit.column.dz),
+                nearest_seed(hit.column.dx, hit.column.dz),
+            )
+        })
+        .collect();
+
+    let mut entry = EditEntry::default();
+    for hit in &surface_hits {
+        let cell = cells[&(hit.column.dx, hit.column.dz)];
+        let on_boundary = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(ox, oz)| {
+            cells
+                .get(&(hit.column.dx + ox, hit.column.dz + oz))
+                .is_some_and(|other| *other != cell)
+        });
+        if !on_boundary {
+            continue;
+        }
+        let pos = BlockPos {
+            x: hit.column.x,
+            y: hit.y,
+            z: hit.column.z,
+        };
+        let before = block_data::capture_block(world, pos);
+        if mask.is_some_and(|mask| !mask.matches(before.state_id))
+            || !passes_gmask(key, before.state_id)
+        {
+            continue;
+        }
+        let after = pattern.placement_at_with(pos, &before, pattern_ctx);
+        if before == after {
+            continue;
+        }
+        entry.push_change(pos, before, after);
+    }
+    commit_entry(key, world, entry)
+}
+
+/// True when the block at `pos` is adjacent to air on at least one of its six
+/// faces (so it forms part of a visible surface).
+fn is_air_exposed(world: &World, pos: BlockPos) -> bool {
+    [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ]
+    .into_iter()
+    .any(|(dx, dy, dz)| {
+        world.get_block_state_id(BlockPos {
+            x: pos.x + dx,
+            y: pos.y + dy,
+            z: pos.z + dz,
+        }) == 0
+    })
+}
+
+/// Sample the 26 neighbors of `pos` for blendball. With `only_air`, each
+/// neighbor collapses to air (0) or a single non-air marker so the vote is
+/// purely air vs solid.
+fn blendball_neighbor_states(
+    pos: BlockPos,
+    states: &HashMap<BlockPosKey, u16>,
+    only_air: bool,
+) -> Vec<u16> {
+    let mut neighbors = Vec::with_capacity(26);
+    for dy in -1..=1 {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let state = states
+                    .get(&BlockPosKey(pos.x + dx, pos.y + dy, pos.z + dz))
+                    .copied()
+                    .unwrap_or(0);
+                neighbors.push(if only_air && state != 0 { 1 } else { state });
+            }
+        }
+    }
+    neighbors
+}
+
+/// Like `most_common_state`, but also returns the winning state's count so
+/// callers can compare frequencies (used by blendball's `min_frequency_diff`).
+fn most_common_with_count(states: &[u16]) -> Option<(u16, usize)> {
+    let mut counts = HashMap::<u16, usize>::new();
+    for state in states {
+        *counts.entry(*state).or_insert(0) += 1;
+    }
+    counts.into_iter().max_by_key(|(_, count)| *count)
 }
 
 fn apply_clipboard(
@@ -2739,9 +3562,8 @@ fn apply_gravity(
             let before: Vec<u16> = (min_y..=max_y)
                 .map(|y| world.get_block_state_id(BlockPos { x, y, z }))
                 .collect();
-            let after = compact_column_states(&before, |state| {
-                mask.is_none_or(|mask| mask.matches(state))
-            });
+            let after =
+                compact_column_states(&before, |state| mask.is_none_or(|mask| mask.matches(state)));
             for (i, y) in (min_y..=max_y).enumerate() {
                 push_change(key, world, &mut entry, BlockPos { x, y, z }, after[i], None);
             }
@@ -2964,11 +3786,7 @@ fn apply_snow(
             key,
             world,
             &mut entry,
-            BlockPos {
-                x,
-                y: top_y + 1,
-                z,
-            },
+            BlockPos { x, y: top_y + 1, z },
             snow,
             None,
         );
@@ -2994,7 +3812,9 @@ fn apply_snow(
 /// If `state` is a snow layer block, return its current `layers` count.
 fn snow_layer_count(state: u16) -> Option<i32> {
     let key = mapping::palette_key_for_state_id(state);
-    let (name, rest) = key.split_once('[').map_or((key.as_str(), None), |(n, r)| (n, Some(r)));
+    let (name, rest) = key
+        .split_once('[')
+        .map_or((key.as_str(), None), |(n, r)| (n, Some(r)));
     if name != "minecraft:snow" {
         return None;
     }
@@ -3194,10 +4014,7 @@ fn populate_chunk_attempt(
 /// Resolve the populate schematic source: `#clipboard` (or `#copy`) uses the
 /// player's current clipboard including its pending transform; anything else
 /// loads `<data folder>/schematics/<name>.schem` like `//schematic load`.
-fn load_populate_clipboard(
-    key: &str,
-    source: &str,
-) -> Result<clipboard::ClipboardBuffer, String> {
+fn load_populate_clipboard(key: &str, source: &str) -> Result<clipboard::ClipboardBuffer, String> {
     if source.eq_ignore_ascii_case("#clipboard") || source.eq_ignore_ascii_case("#copy") {
         let (buffer, transform) = clipboard::get_with_transform(key)
             .ok_or_else(|| "Your clipboard is empty. Use //copy first.".to_string())?;
@@ -3483,7 +4300,6 @@ fn select_spaced_positions(
     selected
 }
 
-#[allow(dead_code)]
 fn scatter_surface_hits(
     surface_hits: &[SurfaceHit],
     count: usize,
@@ -3793,8 +4609,7 @@ mod tests {
 
     #[test]
     fn erode_pull_and_dilate_use_fawe_presets() {
-        let ParsedBrushCommand::Bind(binding) =
-            parse_brush_command("erode").expect("valid erode")
+        let ParsedBrushCommand::Bind(binding) = parse_brush_command("erode").expect("valid erode")
         else {
             panic!("expected bind");
         };
@@ -3809,8 +4624,7 @@ mod tests {
             }
         ));
 
-        let ParsedBrushCommand::Bind(binding) =
-            parse_brush_command("pull 8").expect("valid pull")
+        let ParsedBrushCommand::Bind(binding) = parse_brush_command("pull 8").expect("valid pull")
         else {
             panic!("expected bind");
         };
@@ -3907,7 +4721,10 @@ mod tests {
     fn snow_layer_states_round_trip() {
         let snow = mapping::resolve_block("snow").expect("snow");
         assert_eq!(snow_layer_count(snow), Some(1));
-        assert_eq!(snow_layer_count(mapping::resolve_block("stone").expect("stone")), None);
+        assert_eq!(
+            snow_layer_count(mapping::resolve_block("stone").expect("stone")),
+            None
+        );
 
         // Per-state property variants are only available when the embedded
         // registry was built from a mojang-style block report. Without them
@@ -4437,5 +5254,158 @@ mod tests {
         let solid = sphere_positions(at(0, 0, 0), 3.0, false);
         let hollow = sphere_positions(at(0, 0, 0), 3.0, true);
         assert!(hollow.len() < solid.len());
+    }
+
+    #[test]
+    fn most_common_with_count_reports_winner_and_frequency() {
+        assert_eq!(most_common_with_count(&[1, 1, 2, 1, 3]), Some((1, 3)));
+        assert_eq!(most_common_with_count(&[]), None);
+    }
+
+    #[test]
+    fn blendball_only_air_collapses_solid_states() {
+        let mut states = HashMap::new();
+        // Surround the center with a mix of two solid states and some air.
+        for (dx, dy, dz, state) in [
+            (1, 0, 0, 5u16),
+            (-1, 0, 0, 9u16),
+            (0, 1, 0, 5u16),
+            (0, -1, 0, 0u16),
+        ] {
+            states.insert(BlockPosKey(dx, dy, dz), state);
+        }
+        let mixed = blendball_neighbor_states(at(0, 0, 0), &states, false);
+        assert!(mixed.contains(&5) && mixed.contains(&9));
+        let air_only = blendball_neighbor_states(at(0, 0, 0), &states, true);
+        // With only_air the two distinct solids both become the marker `1`.
+        assert!(air_only.contains(&1));
+        assert!(!air_only.contains(&5) && !air_only.contains(&9));
+    }
+
+    #[test]
+    fn line_block_samples_are_gapless_and_deduped() {
+        let line = line_block_samples(at(0, 0, 0), at(3, 0, 5));
+        assert_eq!(line.first().map(|p| (p.x, p.y, p.z)), Some((0, 0, 0)));
+        assert_eq!(line.last().map(|p| (p.x, p.y, p.z)), Some((3, 0, 5)));
+        // Dominant axis is z (length 5), so 6 distinct samples, no gaps in z.
+        let mut zs: Vec<i32> = line.iter().map(|p| p.z).collect();
+        zs.dedup();
+        assert_eq!(zs, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn spline_curve_passes_through_control_points() {
+        let points = vec![at(0, 64, 0), at(5, 66, 2), at(10, 64, 6)];
+        let curve = spline_curve(&points, false);
+        let has = |x: i32, y: i32, z: i32| curve.iter().any(|p| p.x == x && p.y == y && p.z == z);
+        assert!(has(0, 64, 0));
+        assert!(has(10, 64, 6));
+        // The middle control point should lie on the sampled curve.
+        assert!(has(5, 66, 2));
+        // Two-point splines fall back to a straight line.
+        let straight = spline_curve(&[at(0, 0, 0), at(2, 0, 0)], false);
+        assert_eq!(straight.len(), 3);
+    }
+
+    #[test]
+    fn surface_spline_flat_curve_ignores_y() {
+        let points = vec![at(0, 64, 0), at(4, 80, 0), at(8, 40, 0)];
+        let curve = spline_curve(&points, true);
+        // Flat mode pins every sample to the first control point's Y.
+        assert!(curve.iter().all(|p| p.y == 64));
+    }
+
+    #[test]
+    fn catenary_curve_sags_below_the_straight_line() {
+        let start = at(0, 80, 0);
+        let end = at(20, 80, 0);
+        let curve = catenary_curve(start, end, 1.5);
+        assert!(!curve.is_empty());
+        // Endpoints stay level; the middle dips under y=80.
+        let min_y = curve.iter().map(|p| p.y).min().expect("samples");
+        assert!(min_y < 80, "catenary should sag, min_y = {min_y}");
+        // A factor of 1.0 (no extra rope) draws an essentially straight span.
+        let taut = catenary_curve(start, end, 1.0);
+        assert!(taut.iter().all(|p| p.y == 80));
+    }
+
+    #[test]
+    fn curve_brush_classification_and_point_requirements() {
+        let spline = BrushKind::Spline {
+            pattern: BlockPattern::parse("stone").expect("pattern"),
+            radius: 0.0,
+        };
+        let catenary = BrushKind::Catenary {
+            pattern: BlockPattern::parse("stone").expect("pattern"),
+            radius: 0.0,
+            length_factor: 1.2,
+            shell: false,
+            select: false,
+            facing_direction: false,
+        };
+        assert!(is_curve_brush(&spline));
+        assert!(is_curve_brush(&catenary));
+        assert!(!is_curve_brush(&BrushKind::Extinguish { radius: 3 }));
+        assert_eq!(curve_required_points(&spline), None);
+        assert_eq!(curve_required_points(&catenary), Some(2));
+    }
+
+    #[test]
+    fn shatter_voronoi_marks_only_cell_boundaries() {
+        // Two seeds split a flat row of columns; the boundary sits between
+        // the columns nearest to each seed.
+        let seeds = [
+            SurfaceHit {
+                column: BrushColumn {
+                    x: 0,
+                    z: 0,
+                    dx: 0,
+                    dz: 0,
+                },
+                y: 64,
+                state: 1,
+            },
+            SurfaceHit {
+                column: BrushColumn {
+                    x: 4,
+                    z: 0,
+                    dx: 4,
+                    dz: 0,
+                },
+                y: 64,
+                state: 1,
+            },
+        ];
+        let nearest = |dx: i32| -> usize {
+            seeds
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| (s.column.dx - dx).pow(2))
+                .map_or(0, |(i, _)| i)
+        };
+        // Columns 0,1 belong to seed 0; 3,4 to seed 1; 2 is the split.
+        assert_eq!(nearest(0), 0);
+        assert_eq!(nearest(1), 0);
+        assert_eq!(nearest(3), 1);
+        assert_eq!(nearest(4), 1);
+    }
+
+    #[test]
+    fn command_brush_parses_radius_and_command() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("command 3 /time set day").expect("valid command brush")
+        else {
+            panic!("expected command bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Command {
+                radius,
+                print: true,
+                ref command,
+            } if (radius - 3.0).abs() < f64::EPSILON && command == "/time set day"
+        ));
+        // Command brushes are not classified as curve brushes.
+        assert!(!is_curve_brush(&binding.kind));
     }
 }

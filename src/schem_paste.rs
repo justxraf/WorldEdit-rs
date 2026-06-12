@@ -50,12 +50,9 @@ impl Default for PasteOptions {
     fn default() -> Self {
         Self {
             overwrite_with_air: false,
-            // Bulk schematic pastes should be quiet: no drops, no neighbour
-            // physics, and no per-block placement callbacks/prep.
-            flags: BlockFlags::SKIP_DROPS
-                | BlockFlags::FORCE_STATE
-                | BlockFlags::SKIP_BLOCK_ADDED_CALLBACK
-                | BlockFlags::SKIP_BLOCK_ENTITY_REPLACED_CALLBACK,
+            // Keep bulk schematic pastes quiet while allowing Pumpkin to
+            // create and remove block entities for container blocks.
+            flags: BlockFlags::SKIP_DROPS | BlockFlags::FORCE_STATE,
         }
     }
 }
