@@ -46,19 +46,19 @@ Priority: P0. Finish the brush framework before adding more brush families.
 Priority: P1. Focus on brushes that fit Pumpkin's existing world/block model.
 
 - [x] Sphere / Cylinder / Set / Cuboid: solid baseline exists.
-- [ ] Add missing variants and FAWE-style argument parity for the shape brushes.
+- [x] Add missing variants and FAWE-style argument parity for the shape brushes.
 - [x] Clipboard / Copypaste: basic clipboard paste brush with `-a` and `-o` exists.
 - [x] Expand clipboard brush support with any feasible additional flags and clearer unsupported messaging for `-r` / full FAWE-only behavior.
-- [ ] Add scatter-style clipboard placement and `populate schematic` support if it can be backed by the existing clipboard/schematic code.
+- [x] Add scatter-style clipboard placement and `populate schematic` support if it can be backed by the existing clipboard/schematic code.
 - [x] Smooth: base smoothing implementation exists.
-- [ ] Add dedicated `Flatten` behavior and refine smoothing options toward FAWE defaults.
+- [x] Add dedicated `Flatten` behavior and refine smoothing options toward FAWE defaults.
 - [x] Gravity / Extinguish: baseline implementations exist.
 - [x] Splatter / Blob: splatter-style probabilistic placement exists.
 - [x] Improve splatter/blob behavior with better seeded noise and density controls.
 - [x] Raise / Lower / Erode / Dilate / Morph: baseline terrain sculpting exists.
-- [ ] Improve terrain tools to behave more like FAWE presets and document any intentional deviations.
+- [x] Improve terrain tools to behave more like FAWE presets and document any intentional deviations.
 - [x] Snow: baseline implementation exists.
-- [ ] Extend snow behavior for better layering parity and mask interactions.
+- [x] Extend snow behavior for better layering parity and mask interactions.
 - [x] Height / Heightmap: implement top-column terrain shaping using `top_solid_in_column` plus pattern support.
 
 ## Phase 3: Advanced brushes
@@ -71,7 +71,7 @@ Priority: P2. Implement only where the block API is sufficient; otherwise recogn
 - [ ] SurfaceSpline / Spline / Sweep / Catenary: multi-click curve brushes with per-player temporary control point state.
 - [ ] Shatter: fracture terrain using seeded partitioning/noise.
 - [ ] Command brush: targeted command execution with strict allowlist or server permission gating.
-- [ ] PopulateSchematic: scatter schematic or clipboard placements across valid surfaces.
+- [x] PopulateSchematic: scatter schematic or clipboard placements across valid surfaces (implemented during Phase 2).
 - [ ] Image brush: recognize syntax and return an unsupported message until image loading exists.
 - [ ] BlendBall / Overlay / Surface: implement surface-following block brushes where a solid-top-column model is enough.
 - [ ] Add recognized-but-unsupported handling for entity, biome, feature, and CFI brush families with precise reasons.
@@ -96,7 +96,7 @@ Priority: P3. Improve parity, usability, and safety after the block-capable brus
 - [x] 2. Audit FAWE source/docs for exact brush names, aliases, defaults, and flags.
 - [x] 3. Extend parser, literals, and binding state before adding new apply functions.
 - [x] 4. Add shared helpers for targeting, surfaces, scatter, and noise-driven positions.
-- [ ] 5. Implement P1 block-capable brushes first: shape parity, clipboard expansion, flatten, terrain tools, height/heightmap.
+- [x] 5. Implement P1 block-capable brushes first: shape parity, clipboard expansion, flatten, terrain tools, height/heightmap.
 - [ ] 6. Implement P2 advanced block-capable brushes: scatter, overlay/surface, spline family, shatter, populate schematic.
 - [x] 7. Add or expand tests for parsing, binding persistence, and apply behavior.
 - [x] 8. Fill out permissions, usage text, and unsupported error messages.
@@ -109,6 +109,47 @@ Priority: P3. Improve parity, usability, and safety after the block-capable brus
 - [x] Confirmed FAWE terrain-family naming: `height` also covers `heightmap`, while `cliff` / `flatcylinder` are separate FAWE-facing terrain aliases. WorldEdit-rs now recognizes the `cliff` naming on the flatten path.
 - [x] Confirmed FAWE tool-option naming differences that matter for Phase 1 help text: `target` exposes the same four target enum modes, `scroll` supports `none|clipboard|mask|pattern|target_offset|range|size|target`, and FAWE's `tracemask` aliases differ from the extra stub state WorldEdit-rs stores today.
 - [x] Documented intentional Phase 1 deviations in command help: Pumpkin keeps `clipboard` as the supported paste brush while FAWE's `copypaste`, image-backed `stencil` / `image`, and other richer brush families stay recognized-but-unsupported until later phases.
+
+## Phase 2 notes (completed 2026-06-12)
+
+All behavior was audited against the local `FastAsyncWorldEdit` checkout (`worldedit-core/src/main/java/com/sk89q/worldedit/command/BrushCommands.java` plus the brush classes under `com/fastasyncworldedit/core/command/tool/brush/` and `com/sk89q/worldedit/command/tool/brush/`).
+
+What was implemented:
+
+- [x] Sphere: FAWE default radius 2, `-f` falling-sphere variant (`FallingSphere` column-settling port in `falling_sphere_positions`), flags accepted in any argument position via the shared `split_flags` helper.
+- [x] Cylinder: FAWE default radius 2, fourth positional `thickness` argument for hollow cylinders, and hollow cylinders are now open-ended tubes (the old top/bottom caps did not match FAWE's `HollowCylinderBrush`).
+- [x] Erode family: `erode` = FAWE `ErodeBrush(2, 1, 5, 1)` with the four optional face/iteration arguments, new `pull` alias = FAWE `RaiseBrush(6, 0, 1, 1)`, `dilate` = FAWE `MorphBrush(5, 1, 2, 1)` preset (radius-only), all mapped onto the existing `BrushKind::Morph` apply path.
+- [x] Gravity: `-h` is a switch (scan from world bottom, FAWE `fullHeight`) instead of the old `-h <height>` argument; footprint is FAWE's square column area; column compaction extracted into testable `compact_column_states`.
+- [x] Snow: real layer parity via the block-state registry — stacking increments `snow[layers=N]`, the 8th layer converts to `snow_block`, partial layer stacks refuse a new layer in non-stack mode, and `snowy=true` is applied to grass-like blocks beneath new snow. Degrades to no-op stacking when the embedded registry lacks per-state variants.
+- [x] Smooth: FAWE default radius 2 (was 5).
+- [x] PopulateSchematic: implemented. `#clipboard` (or `#copy`) uses the player clipboard including pending transform; any other source loads `<data folder>/schematics/<name>.schem`. Placement mirrors FAWE `Extent#addSchems`/`SchemGen`: one density%-gated attempt per chunk in the brush cuboid, pasted air-skipped with origin anchored one block above the masked surface hit, optional deterministic rotation with `-r`. The plugin data folder is captured at registration into the `DATA_FOLDER` thread-local.
+- [x] `snowsmooth` got its own precise unsupported message (block-only smoothing exists; snow-layer-aware heightmap smoothing does not).
+- [x] Tests: parser coverage for all of the above plus pure-helper tests for `compact_column_states`, `snow_layer_count`, `populate_chunk_attempt`, and capless hollow cylinders. Native-target run: 188 passed; the 5 remaining failures (mapping/pattern/transform state-variant tests) pre-exist on a clean tree because the Pumpkin-style `blocks.json` carries no per-state property data.
+
+Intentional deviations from FAWE (also documented in the `brush.rs` module docs):
+
+- Erode/pull/dilate use the 6-neighbor morph pass instead of FAWE's 4-face cardinal erosion, and erosion carves to air instead of the most common neighboring fluid.
+- Gravity compacts columns fully (upstream WorldEdit behavior) rather than reproducing FAWE's gap-preserving `freeSpot = y + 1` quirk.
+- Populate schematic, splatter, and clipboard random rotation derive randomness from position hashes, not `ThreadLocalRandom`, so repeated clicks are reproducible for undo/tests.
+- Sphere does not auto-switch sand/gravel patterns to falling mode (FAWE prints a hint and forces `-f`); users pass `-f` explicitly.
+- `pull` reuses the `worldedit.brush.morph` permission node instead of FAWE's `worldedit.brush.pull`.
+- Populate schematic loads the schematic file on every brush use rather than caching at bind time.
+
+## Phase 3 hand-off notes (for the next session)
+
+Read these before starting Phase 3; the conversation that produced Phase 2 was cleared.
+
+- FAWE reference source lives at `..\FastAsyncWorldEdit\worldedit-core\src\main\java\` (note: `Glob` may fail on that OneDrive tree; use PowerShell `Get-ChildItem -Recurse -Filter` instead).
+- Existing shared helpers in `brush.rs` to reuse: `surface_hits_for_shape` / `top_solid_in_column` (masked surface scans), `select_spaced_positions` + `scatter_surface_hits` (deterministic spaced sampling — already exactly what Scatter needs), `position_hash` (seeded determinism), `apply_pattern_positions` / `push_change` / `commit_entry` (mask + gmask + history plumbing), `split_flags` (FAWE-style switches anywhere), and `crate::simplex_noise` for noise-backed brushes.
+- Scatter / ScatterOverlay (`BrushKind::Scatter`/`ScatterOverlay`, parsed and stored already): FAWE `ScatterBrush` picks `points` surface positions at least `distance` apart inside the radius and applies the pattern at the surface block; the overlay variant places one block above the surface instead. Wire `scatter_surface_hits` to the apply path.
+- BlendBall (`BrushKind::BlendBall`): FAWE `BlendBall` replaces each block in the sphere with the most common state among its 26 neighbors when the frequency difference is at least `min_frequency_diff`; `-a` only swaps air vs non-air. `most_common_state` exists for morph; extend to a 26-neighbor sample.
+- Surface (`BrushKind::Surface`): FAWE `SurfaceSphereBrush` applies the pattern to existing surface blocks (blocks with air exposure) inside the sphere. Overlay (`BrushKind::Overlay`): place the pattern one block above masked top-column hits in the disc.
+- Shatter (`BrushKind::Shatter`): FAWE `ShatterBrush` picks `count` seeded points on the surface and draws Voronoi cell boundaries (blocks whose nearest-seed differs from a neighbor's nearest-seed get the pattern). Keep seeds deterministic via `position_hash`.
+- Spline family (`Spline`, `SurfaceSpline`, `Catenary`, `Sweep`): need per-player accumulated control points (add a `Vec<BlockPos>` to the per-player state next to `BRUSHES`; FAWE ends point collection when the same block is clicked twice). Catenary hangs a rope curve between two clicks; Sweep pastes the clipboard along the curve. Start with `Spline` and `Catenary`; `//line`-style block tracing helpers exist in `src/commands/generation.rs` (curve/line code) and may be reusable.
+- Command / ScatterCommand brushes: first check whether `pumpkin_plugin_api` exposes any command-dispatch API for plugins (none was found during Phase 2 — if still absent, keep them recognized-but-unsupported with a precise reason instead of partially implementing).
+- Image brush: keep recognized-but-unsupported (no image loading); `image` and `stencil` are not currently in the literal registration list — add them as recognized names with precise unsupported reasons.
+- Block-state caveat: per-state property variants (e.g. `snow[layers=N]`, stair facings) resolve to default states with the current Pumpkin-style `blocks.json`; write apply paths so they degrade to no-ops rather than wrong blocks, and gate tests like `snow_layer_states_round_trip` does.
+- Run tests with `cargo test --target x86_64-pc-windows-msvc` (the default target is `wasm32-wasip2`, whose test binary cannot execute on Windows). Expect exactly 5 pre-existing failures unrelated to brushes.
 
 ## Notes for future passes
 

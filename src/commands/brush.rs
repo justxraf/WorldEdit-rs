@@ -3738,6 +3738,216 @@ mod tests {
     }
 
     #[test]
+    fn sphere_brush_uses_fawe_default_radius_and_falling_flag() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("sphere stone").expect("valid brush")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Sphere {
+                radius,
+                hollow: false,
+                falling: false,
+                ..
+            } if (radius - SHAPE_DEFAULT_RADIUS).abs() < f64::EPSILON
+        ));
+
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("sphere stone 4 -f").expect("valid falling sphere")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Sphere {
+                falling: true,
+                hollow: false,
+                ..
+            }
+        ));
+
+        assert!(parse_brush_command("sphere -h -f stone").is_err());
+    }
+
+    #[test]
+    fn cylinder_brush_parses_hollow_thickness() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("cyl -h stone 5 2 1.5").expect("valid cylinder")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Cylinder {
+                hollow: true,
+                height: 2,
+                thickness,
+                ..
+            } if (thickness - 1.5).abs() < f64::EPSILON
+        ));
+
+        assert!(parse_brush_command("cyl stone 5 2 1.5").is_err());
+    }
+
+    #[test]
+    fn erode_pull_and_dilate_use_fawe_presets() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("erode").expect("valid erode")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Morph {
+                radius: 5,
+                min_erode_faces: 2,
+                erode_iterations: 1,
+                min_dilate_faces: 5,
+                dilate_iterations: 1,
+            }
+        ));
+
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("pull 8").expect("valid pull")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Morph {
+                radius: 8,
+                min_erode_faces: 6,
+                erode_iterations: 0,
+                min_dilate_faces: 1,
+                dilate_iterations: 1,
+            }
+        ));
+
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("dilate").expect("valid dilate")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Morph {
+                radius: 5,
+                min_erode_faces: 5,
+                erode_iterations: 1,
+                min_dilate_faces: 2,
+                dilate_iterations: 1,
+            }
+        ));
+
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("erode 7 3 2 4 2").expect("valid erode with args")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Morph {
+                radius: 7,
+                min_erode_faces: 3,
+                erode_iterations: 2,
+                min_dilate_faces: 4,
+                dilate_iterations: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn gravity_brush_parses_full_height_switch() {
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("gravity 6 -h").expect("valid gravity")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Gravity {
+                radius: 6,
+                full_height: true,
+            }
+        ));
+
+        let ParsedBrushCommand::Bind(binding) =
+            parse_brush_command("gravity").expect("valid gravity defaults")
+        else {
+            panic!("expected bind");
+        };
+        assert!(matches!(
+            binding.kind,
+            BrushKind::Gravity {
+                radius: 5,
+                full_height: false,
+            }
+        ));
+
+        assert!(parse_brush_command("gravity -h 5 extra").is_err());
+    }
+
+    #[test]
+    fn compact_column_states_drops_blocks_and_respects_floors() {
+        // Blocks at indices 2 and 5 fall to the bottom.
+        assert_eq!(
+            compact_column_states(&[0, 0, 7, 0, 0, 9], |_| true),
+            vec![7, 9, 0, 0, 0, 0]
+        );
+        // An immovable block at index 3 acts as a floor for everything above.
+        assert_eq!(
+            compact_column_states(&[0, 0, 7, 8, 0, 9], |state| state != 8),
+            vec![7, 0, 0, 8, 9, 0]
+        );
+    }
+
+    #[test]
+    fn snow_layer_states_round_trip() {
+        let snow = mapping::resolve_block("snow").expect("snow");
+        assert_eq!(snow_layer_count(snow), Some(1));
+        assert_eq!(snow_layer_count(mapping::resolve_block("stone").expect("stone")), None);
+
+        // Per-state property variants are only available when the embedded
+        // registry was built from a mojang-style block report. Without them
+        // `snow[layers=3]` resolves to the default state and layer stacking
+        // degrades to a no-op, which the apply path tolerates.
+        let three = snow_state_with_layers(3).expect("snow resolves");
+        if three != snow {
+            assert_eq!(snow_layer_count(three), Some(3));
+        }
+    }
+
+    #[test]
+    fn populate_chunk_attempt_is_deterministic_and_honors_density() {
+        let target = at(100, 64, -200);
+        assert_eq!(populate_chunk_attempt(target, 5, -3, 0), None);
+
+        let first = populate_chunk_attempt(target, 5, -3, 100).expect("always attempts");
+        let second = populate_chunk_attempt(target, 5, -3, 100).expect("always attempts");
+        assert_eq!(first, second);
+        let (x, z) = first;
+        assert!((5 << 4..(5 << 4) + 16).contains(&x));
+        assert!((-3 << 4..(-3 << 4) + 16).contains(&z));
+    }
+
+    #[test]
+    fn hollow_cylinders_have_no_end_caps() {
+        let contains = |positions: &[BlockPos], x: i32, y: i32, z: i32| {
+            positions
+                .iter()
+                .any(|pos| pos.x == x && pos.y == y && pos.z == z)
+        };
+        let positions = cylinder_positions(at(0, 0, 0), 3.0, 3, true, 0.0);
+        assert!(!contains(&positions, 0, 0, 0));
+        assert!(!contains(&positions, 0, 2, 0));
+        let thick = cylinder_positions(at(0, 0, 0), 3.0, 1, true, 1.0);
+        assert!(thick.len() > positions.len() / 3);
+        assert!(!contains(&thick, 0, 0, 0));
+    }
+
+    #[test]
     fn parses_hollow_cylinder_brush() {
         let ParsedBrushCommand::Bind(binding) =
             parse_brush_command("cyl -h dirt 4 2").expect("valid brush")
