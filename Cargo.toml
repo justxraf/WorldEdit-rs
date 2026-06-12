@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # This is the api crate that makes creating plugins easier, and has wit definitions.
 pumpkin-plugin-api = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-plugin-api" }
+pumpkin-data = { path = "C:/Users/justxdude/OneDrive/Documents/Visual Studio Projects/pumpkin/Pumpkin/pumpkin-data", default-features = false, features = ["block"] }
 tracing = "0.1.44"
 
 # Schematic loading.

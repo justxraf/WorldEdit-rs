@@ -13,7 +13,7 @@ use pumpkin_plugin_api::common::BlockPos;
 
 use crate::{
     clipboard::{self, ClipboardBuffer},
-    mapping,
+    mapping, simplex_noise,
 };
 
 #[derive(Clone, Debug)]
@@ -67,7 +67,7 @@ pub enum BlockPattern {
     },
     Simplex {
         input: String,
-        scale: i32,
+        inverse_scale: f64,
         pattern: Box<BlockPattern>,
     },
     Linear {
@@ -124,6 +124,7 @@ impl ClipboardPatternKind {
 pub struct PatternEvalContext {
     origin: BlockPos,
     clipboard: Option<PreparedClipboardPattern>,
+    random_source: PatternRandomSource,
 }
 
 impl PatternEvalContext {
@@ -131,6 +132,7 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: None,
+            random_source: PatternRandomSource::PositionHash,
         }
     }
 
@@ -138,6 +140,7 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: clipboard::get(key).and_then(PreparedClipboardPattern::from_buffer),
+            random_source: PatternRandomSource::PositionHash,
         }
     }
 
@@ -146,7 +149,24 @@ impl PatternEvalContext {
         Self {
             origin,
             clipboard: PreparedClipboardPattern::from_buffer(buffer),
+            random_source: PatternRandomSource::PositionHash,
         }
+    }
+
+    fn with_random_source(&self, random_source: PatternRandomSource) -> Self {
+        Self {
+            origin: self.origin,
+            clipboard: self.clipboard.clone(),
+            random_source,
+        }
+    }
+
+    fn weighted_pick(&self, pos: BlockPos, total: u32) -> u32 {
+        self.random_source.weighted_pick(pos, total)
+    }
+
+    fn random_index(&self, pos: BlockPos, len: usize) -> usize {
+        self.random_source.random_index(pos, len)
     }
 }
 
@@ -162,6 +182,32 @@ struct PreparedClipboardPattern {
     height: usize,
     length: usize,
     blocks: Vec<u16>,
+}
+
+#[derive(Clone, Copy)]
+enum PatternRandomSource {
+    PositionHash,
+    Simplex { inverse_scale: f64 },
+}
+
+impl PatternRandomSource {
+    fn weighted_pick(self, pos: BlockPos, total: u32) -> u32 {
+        match self {
+            Self::PositionHash => position_hash(pos) % total,
+            Self::Simplex { inverse_scale } => {
+                bounded_pick(simplex_noise_unit(pos, inverse_scale), total)
+            }
+        }
+    }
+
+    fn random_index(self, pos: BlockPos, len: usize) -> usize {
+        match self {
+            Self::PositionHash => (position_hash(pos) as usize) % len,
+            Self::Simplex { inverse_scale } => {
+                bounded_index(simplex_noise_unit(pos, inverse_scale), len)
+            }
+        }
+    }
 }
 
 impl PreparedClipboardPattern {
@@ -239,7 +285,7 @@ impl BlockPattern {
                 clipboard.state_at(pos, ctx.origin, *offset)
             }),
             Self::Weighted { entries, total, .. } => {
-                let mut pick = position_hash(pos) % *total;
+                let mut pick = ctx.weighted_pick(pos, *total);
                 for entry in entries {
                     if pick < entry.weight {
                         return entry.pattern.state_at_with(pos, before, ctx);
@@ -251,7 +297,7 @@ impl BlockPattern {
                 })
             }
             Self::RandomStates { states, .. } => {
-                let index = (position_hash(pos) as usize) % states.len();
+                let index = ctx.random_index(pos, states.len());
                 states[index]
             }
             Self::TypeApply { pattern, .. } => {
@@ -306,14 +352,16 @@ impl BlockPattern {
                     false_pattern.state_at_with(pos, before, ctx)
                 }
             }
-            Self::Simplex { scale, pattern, .. } => pattern.state_at_with(
-                BlockPos {
-                    x: pos.x.div_euclid(*scale),
-                    y: pos.y.div_euclid(*scale),
-                    z: pos.z.div_euclid(*scale),
-                },
+            Self::Simplex {
+                inverse_scale,
+                pattern,
+                ..
+            } => pattern.state_at_with(
+                pos,
                 before,
-                ctx,
+                &ctx.with_random_source(PatternRandomSource::Simplex {
+                    inverse_scale: *inverse_scale,
+                }),
             ),
             Self::Linear {
                 cursor, patterns, ..
@@ -654,19 +702,20 @@ fn parse_fawe_pattern(input: &str) -> Result<BlockPattern, String> {
             if args.is_empty() {
                 return Err(format!("Missing child pattern for '{input}'."));
             }
-            let (scale, pattern_index) = if args.len() >= 2 {
-                (parse_positive_i32_arg(&args[0], "scale", input)?, 1)
+            let (inverse_scale, pattern_index) = if args.len() >= 2 {
+                (parse_simplex_scale(&args[0], input)?, 1)
             } else {
-                (10, 0)
+                (1.0 / 10.0, 0)
             };
             Ok(BlockPattern::Simplex {
                 input: input.to_string(),
-                scale,
+                inverse_scale,
                 pattern: Box::new(parse_pattern(&args[pattern_index])?),
             })
         }
         "#biome" => Err(format!(
-            "Pattern '{input}' needs biome editing support, which is not implemented yet."
+            "Pattern '{input}' needs biome editing support, but Pumpkin only exposes \
+             world.get-biome today and does not provide world.set-biome yet."
         )),
         "#color" | "#saturate" | "#darken" | "#anglecolor" | "#desaturate" | "#averagecolor"
         | "#lighten" => Err(format!(
@@ -861,12 +910,14 @@ fn parse_i32_arg(raw: &str, name: &str, whole: &str) -> Result<i32, String> {
         .map_err(|_| format!("Invalid {name} '{raw}' in pattern '{whole}'."))
 }
 
-fn parse_positive_i32_arg(raw: &str, name: &str, whole: &str) -> Result<i32, String> {
-    let value = parse_i32_arg(raw, name, whole)?;
-    if value <= 0 {
-        return Err(format!("{name} must be positive in pattern '{whole}'."));
+fn parse_simplex_scale(raw: &str, whole: &str) -> Result<f64, String> {
+    let scale = raw
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid scale '{raw}' in pattern '{whole}'."))?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(format!("scale must be positive in pattern '{whole}'."));
     }
-    Ok(value)
+    Ok(1.0 / scale.max(1.0))
 }
 
 fn parse_weight(raw: &str, whole: &str) -> Result<u32, String> {
@@ -1037,6 +1088,30 @@ fn position_hash(pos: BlockPos) -> u32 {
     x
 }
 
+fn simplex_noise_unit(pos: BlockPos, inverse_scale: f64) -> f64 {
+    cap_unit_interval(
+        (simplex_noise::noise3(
+            f64::from(pos.x) * inverse_scale,
+            f64::from(pos.y) * inverse_scale,
+            f64::from(pos.z) * inverse_scale,
+        ) + 1.0)
+            * 0.5,
+    )
+}
+
+fn bounded_pick(unit: f64, total: u32) -> u32 {
+    (unit * f64::from(total)) as u32
+}
+
+fn bounded_index(unit: f64, len: usize) -> usize {
+    ((unit * len as f64) as usize).min(len.saturating_sub(1))
+}
+
+fn cap_unit_interval(value: f64) -> f64 {
+    const MAX_EXCLUSIVE_ONE: f64 = f64::from_bits(0x3fefffffffffffff);
+    value.clamp(0.0, MAX_EXCLUSIVE_ONE)
+}
+
 fn wrap_pattern_axis(value: i64, offset: i32, len: usize) -> usize {
     (value + i64::from(offset)).rem_euclid(len as i64) as usize
 }
@@ -1131,6 +1206,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_namespaced_block_tag_pattern() {
+        let pattern = BlockPattern::parse("##minecraft:slabs").unwrap();
+        assert!(matches!(pattern, BlockPattern::RandomStates { .. }));
+    }
+
+    #[test]
+    fn block_tag_pattern_rejects_empty_tags() {
+        let err = BlockPattern::parse("##c:ropes").unwrap_err();
+        assert!(err.contains("empty block category"));
+    }
+
+    #[test]
     fn parses_fawe_offset_bracket_syntax() {
         let pattern = BlockPattern::parse("#offset[1][0][0][stone,dirt]").unwrap();
         assert_eq!(pattern.description(), "#offset[1][0][0][stone,dirt]");
@@ -1151,8 +1238,36 @@ mod tests {
 
     #[test]
     fn parses_simplex_pattern() {
-        let pattern = BlockPattern::parse("#simplex[8][stone,dirt]").unwrap();
+        let pattern = BlockPattern::parse("#simplex[2.5][stone,dirt]").unwrap();
         assert!(matches!(pattern, BlockPattern::Simplex { .. }));
+    }
+
+    #[test]
+    fn simplex_pattern_matches_fawe_weighted_bucket_choices() {
+        let pattern = BlockPattern::parse("#simplex[10][stone,dirt]").unwrap();
+        assert_eq!(pattern.state_at(at(0, 0, 0), 0), 10);
+        assert_eq!(pattern.state_at(at(10, 0, 0), 0), 1);
+        assert_eq!(pattern.state_at(at(15, 0, 0), 0), 1);
+        assert_eq!(pattern.state_at(at(20, 0, 0), 0), 10);
+        assert_eq!(pattern.state_at(at(3, 7, 11), 0), 1);
+        assert_eq!(pattern.state_at(at(-9, 2, 14), 0), 10);
+    }
+
+    #[test]
+    fn simplex_pattern_matches_fawe_list_bucket_choices() {
+        let pattern = BlockPattern::parse("#simplex[8][stone,dirt,grass_block]").unwrap();
+        assert_eq!(pattern.state_at(at(0, 0, 0), 0), 10);
+        assert_eq!(pattern.state_at(at(4, 0, 0), 0), 9);
+        assert_eq!(pattern.state_at(at(8, 0, 0), 0), 1);
+        assert_eq!(pattern.state_at(at(12, 0, 0), 0), 10);
+        assert_eq!(pattern.state_at(at(-9, 2, 14), 0), 1);
+    }
+
+    #[test]
+    fn biome_pattern_reports_missing_biome_write_support() {
+        let err = BlockPattern::parse("#biome[plains]").unwrap_err();
+        assert!(err.contains("world.get-biome"));
+        assert!(err.contains("world.set-biome"));
     }
 
     #[test]

@@ -10,17 +10,23 @@
 //! - [`schem_paste`] — placing a parsed schematic into the world at a centre.
 //! - [`selection`]   — per-player pos1/pos2 selection state and region helpers.
 //! - [`clipboard`]   — per-player copy/paste buffer.
+//! - [`transform`]   — block position and state rotation/flip transformations.
 //! - [`history`]     — per-player undo/redo stack.
+//! - [`mask`]        — per-player global mask (`//gmask`).
 //! - [`commands`]    — `//` command registration and handlers.
 
+mod block_data;
 mod clipboard;
 mod commands;
 mod history;
 mod mapping;
+mod mask;
 mod pattern;
 mod schem_paste;
 mod schematic;
 mod selection;
+mod simplex_noise;
+mod transform;
 
 use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata, Result,

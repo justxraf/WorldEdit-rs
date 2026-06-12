@@ -17,7 +17,7 @@ use pumpkin_plugin_api::{
     world::BlockChange,
 };
 
-use crate::{clipboard, history, history::EditEntry, mapping, selection};
+use crate::{clipboard, history, history::EditEntry, mapping, selection, transform};
 
 use super::{batch_size, block_flags, command_names, player_key, sender_block_pos};
 

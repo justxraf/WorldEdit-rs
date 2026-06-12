@@ -18,6 +18,7 @@ mod clearhistory;
 mod copy;
 mod count;
 mod cut;
+mod gmask;
 mod paste;
 mod pos;
 mod redo;
@@ -41,7 +42,7 @@ use pumpkin_plugin_api::{
     world::BlockFlags,
 };
 
-use crate::selection;
+use crate::{mask, selection};
 
 const PERMISSION_NAMESPACE: &str = "worldedit-rs";
 
@@ -203,6 +204,10 @@ pub fn register(context: &Context) {
             "worldedit-rs:command.schematic",
             "Allows using the //schematic dispatcher.",
         ),
+        (
+            "worldedit.global-mask",
+            "Allows setting a global mask with //gmask.",
+        ),
     ] {
         let node = permission_node(node);
         if let Err(e) = context.register_permission(&Permission {
@@ -236,13 +241,14 @@ pub fn register(context: &Context) {
     wand::register(context);
     schematic::register(context);
     brush::register(context);
+    gmask::register(context);
 
     logging::log(
         LogLevel::Info,
         "WorldEdit-rs: //pos1, //pos2, //hpos1, //hpos2, //sel, //set, //replace, //copy, //cut, \
          //paste, //undo, //redo, //size, //clearclipboard, //clearhistory, //expand, //contract, \
          //shift, //outset, //inset, //count, //walls, //faces, //outline, //wand, //schematic \
-         (//schem), //brush (//br) registered.",
+         (//schem), //brush (//br), //gmask registered.",
     );
 }
 
@@ -349,4 +355,15 @@ pub fn sender_block_pos(sender: &CommandSender) -> std::result::Result<BlockPos,
 /// linear memory.
 pub fn batch_size() -> usize {
     1 << 16 // 65,536
+}
+
+/// `true` if `before` passes the player's global mask (`//gmask`), or if no
+/// global mask is set.
+///
+/// Every edit path (`//set`, `//replace`, `//cut`'s leave-fill, `//paste`,
+/// shell commands, and brushes) should skip a position - not add it to its
+/// change list - when this returns `false`, layering `//gmask` on top of
+/// whatever mask the command itself applies.
+pub fn passes_gmask(key: &str, before: u16) -> bool {
+    mask::passes(key, before)
 }

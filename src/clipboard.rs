@@ -13,6 +13,7 @@ use pumpkin_plugin_api::{common::BlockPos, world::World};
 use crate::mapping;
 use crate::schematic::Schematic;
 use crate::selection::Region;
+use crate::transform::Transform;
 
 /// `(width, height, length, offset, palette_keys)`, as produced by
 /// [`ClipboardBuffer::to_schematic_blocks`] and consumed by
@@ -185,21 +186,35 @@ pub fn capture_filtered(
 }
 
 thread_local! {
-    /// Clipboards keyed by player name. The plugin's wasm component is
-    /// single-threaded, so a thread-local map is sufficient.
-    static CLIPBOARDS: RefCell<HashMap<String, ClipboardBuffer>> = RefCell::new(HashMap::new());
+    /// Clipboards keyed by player name. Each entry stores a buffer and its pending transform.
+    /// The plugin's wasm component is single-threaded, so a thread-local map is sufficient.
+    static CLIPBOARDS: RefCell<HashMap<String, (ClipboardBuffer, Transform)>> = RefCell::new(HashMap::new());
 }
 
-/// Store `buffer` as `key`'s clipboard, replacing any previous contents.
+/// Store `buffer` as `key`'s clipboard with identity transform, replacing any previous contents.
 pub fn set(key: &str, buffer: ClipboardBuffer) {
     CLIPBOARDS.with_borrow_mut(|map| {
-        map.insert(key.to_string(), buffer);
+        map.insert(key.to_string(), (buffer, Transform::identity()));
     });
 }
 
-/// Clone `key`'s clipboard, if any.
+/// Clone `key`'s clipboard buffer (without its transform), if any.
 pub fn get(key: &str) -> Option<ClipboardBuffer> {
+    CLIPBOARDS.with_borrow(|map| map.get(key).map(|(buffer, _)| buffer.clone()))
+}
+
+/// Get `key`'s clipboard buffer and its pending transform.
+pub fn get_with_transform(key: &str) -> Option<(ClipboardBuffer, Transform)> {
     CLIPBOARDS.with_borrow(|map| map.get(key).cloned())
+}
+
+/// Update the transform for `key`'s clipboard, combining with any existing transform.
+pub fn set_transform(key: &str, new_transform: Transform) {
+    CLIPBOARDS.with_borrow_mut(|map| {
+        if let Some((buffer, transform)) = map.get_mut(key) {
+            *transform = transform.combine(new_transform);
+        }
+    });
 }
 
 /// Remove `key`'s clipboard. Returns `true` if one existed.
@@ -270,6 +285,38 @@ mod tests {
         assert!(clear(key));
         assert!(get(key).is_none());
         assert!(!clear(key));
+    }
+
+    #[test]
+    fn get_with_transform_returns_identity_by_default() {
+        let key = "get_with_transform_returns_identity_by_default";
+        set(
+            key,
+            ClipboardBuffer {
+                origin: at(0, 0, 0),
+                blocks: vec![((0, 0, 0), 1)],
+            },
+        );
+        let (_buffer, transform) = get_with_transform(key).unwrap();
+        assert!(transform.is_identity());
+    }
+
+    #[test]
+    fn set_transform_combines_with_existing() {
+        use crate::transform::Transform;
+
+        let key = "set_transform_combines_with_existing";
+        set(
+            key,
+            ClipboardBuffer {
+                origin: at(0, 0, 0),
+                blocks: vec![((0, 0, 0), 1)],
+            },
+        );
+        set_transform(key, Transform::rotate_y(90).unwrap());
+        set_transform(key, Transform::rotate_y(90).unwrap());
+        let (_, transform) = get_with_transform(key).unwrap();
+        assert_eq!(transform.rot_y, 2); // Two 90° rotations = 180°
     }
 
     #[test]

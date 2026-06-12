@@ -10,10 +10,13 @@ use pumpkin_plugin_api::{
     command_wit::{Arg, ArgumentType, Number, StringType},
     logging::{self, LogLevel},
     text::TextComponent,
-    world::{BlockChange, World},
+    world::World,
 };
 
-use crate::history::{self, EditEntry};
+use crate::{
+    block_data,
+    history::{self, EditEntry},
+};
 
 use super::{block_flags, command_names, player_key};
 
@@ -103,12 +106,10 @@ impl pumpkin_plugin_api::commands::CommandHandler for RedoCommand {
 
 /// Reapply every block in `entry` to its `after` state.
 fn apply_redo(world: &World, entry: &EditEntry) {
-    let changes: Vec<BlockChange> = entry
+    let changes: Vec<_> = entry
         .changes
         .iter()
-        .map(|&(pos, _before, after)| BlockChange { pos, state: after })
+        .map(|change| (change.pos, change.after.clone()))
         .collect();
-    if !changes.is_empty() {
-        world.set_block_states(&changes, block_flags());
-    }
+    block_data::apply_blocks(world, &changes, block_flags());
 }

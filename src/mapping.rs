@@ -35,8 +35,14 @@ pub struct GeneratedBlock {
     pub variants: &'static [(&'static str, u16)],
 }
 
+pub struct GeneratedBlockTag {
+    pub name: &'static str,
+    pub blocks: &'static [&'static str],
+}
+
 // Pulls in `pub static GENERATED_BLOCKS: &[GeneratedBlock]`.
 include!(concat!(env!("OUT_DIR"), "/block_map.rs"));
+include!(concat!(env!("OUT_DIR"), "/block_tags.rs"));
 
 /// Minimal hand-written table so Stage-1 testing works before `blocks.json` is
 /// vendored. These ids are the vanilla 1.21 flattened global state ids, which is
@@ -136,29 +142,34 @@ pub fn state_ids_for_block(input: &str) -> Vec<u16> {
     resolve_block(trimmed).into_iter().collect()
 }
 
-/// Best-effort block-tag support for FAWE/WorldEdit category patterns
-/// (`##wool`, `##*slabs`) using the generated block registry. Pumpkin does not
-/// expose data-pack tags here, so this matches common vanilla category suffixes.
+/// Resolve a block tag such as `minecraft:slabs` or `c:stones`.
+///
+/// `##tag` returns the tag's direct block members (one default state per block),
+/// while `##*tag` expands each tagged block to every known state in the embedded
+/// block registry.
 pub fn state_ids_for_tag(tag: &str, all_states: bool) -> Vec<u16> {
     let tag = normalize_tag(tag);
-    let mut states = Vec::new();
+    let Some(tag) = find_generated_tag(&tag) else {
+        return Vec::new();
+    };
 
-    for block in GENERATED_BLOCKS {
-        if !block_matches_tag(block.name, &tag) {
-            continue;
-        }
-        if all_states && !block.variants.is_empty() {
-            for &(_, id) in block.variants {
-                if !states.contains(&id) {
-                    states.push(id);
-                }
+    if all_states {
+        let mut states = Vec::new();
+        for &block in tag.blocks {
+            for state_id in state_ids_for_block(block) {
+                push_unique_state(&mut states, state_id);
             }
-        } else if !states.contains(&block.default_id) {
-            states.push(block.default_id);
         }
+        states
+    } else {
+        let mut states = Vec::new();
+        for &block in tag.blocks {
+            if let Some(state_id) = state_id_for(block) {
+                push_unique_state(&mut states, state_id);
+            }
+        }
+        states
     }
-
-    states
 }
 
 /// Apply the property string from `before` to the block type represented by
@@ -288,27 +299,27 @@ fn find_generated(name: &str) -> Option<&'static GeneratedBlock> {
     GENERATED_BLOCKS.iter().find(|b| b.name == name)
 }
 
+fn find_generated_tag(name: &str) -> Option<&'static GeneratedBlockTag> {
+    GENERATED_BLOCK_TAGS.iter().find(|tag| tag.name == name)
+}
+
 fn normalize_tag(tag: &str) -> String {
     let tag = tag
         .trim()
         .trim_start_matches('#')
         .trim_start_matches('*')
-        .strip_prefix("minecraft:")
-        .unwrap_or_else(|| tag.trim().trim_start_matches('#').trim_start_matches('*'));
-    tag.to_ascii_lowercase()
+        .to_ascii_lowercase();
+    if tag.contains(':') {
+        tag
+    } else {
+        format!("minecraft:{tag}")
+    }
 }
 
-fn block_matches_tag(block_name: &str, tag: &str) -> bool {
-    let block = block_name
-        .strip_prefix("minecraft:")
-        .unwrap_or(block_name)
-        .to_ascii_lowercase();
-    if block == tag || block.ends_with(&format!("_{tag}")) {
-        return true;
+fn push_unique_state(states: &mut Vec<u16>, state_id: u16) {
+    if !states.contains(&state_id) {
+        states.push(state_id);
     }
-
-    let singular = tag.strip_suffix('s').unwrap_or(tag);
-    block == singular || block.ends_with(&format!("_{singular}"))
 }
 
 /// Split `"minecraft:oak_log[axis=x,foo=bar]"` into
@@ -406,5 +417,29 @@ mod tests {
             state_id_for(&palette_key_for_state_id(stone_id)),
             Some(stone_id)
         );
+    }
+
+    #[test]
+    fn block_tags_support_namespaced_lookup() {
+        let slab_defaults = state_ids_for_tag("minecraft:slabs", false);
+        assert!(!slab_defaults.is_empty());
+        assert!(slab_defaults.contains(&state_id_for("minecraft:oak_slab").unwrap()));
+    }
+
+    #[test]
+    fn block_tags_return_empty_for_empty_tags() {
+        assert!(state_ids_for_tag("c:ropes", false).is_empty());
+    }
+
+    #[test]
+    fn block_tags_can_expand_to_all_known_states() {
+        let slab_defaults = state_ids_for_tag("minecraft:slabs", false);
+        let slab_states = state_ids_for_tag("minecraft:slabs", true);
+        let oak_slab_states = state_ids_for_block("minecraft:oak_slab");
+
+        assert!(oak_slab_states.len() > 1);
+        assert!(oak_slab_states.iter().all(|id| slab_states.contains(id)));
+        assert!(oak_slab_states.iter().any(|id| !slab_defaults.contains(id)));
+        assert!(slab_states.len() > slab_defaults.len());
     }
 }

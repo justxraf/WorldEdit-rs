@@ -2,7 +2,7 @@
 
 ## Pattern
 
-- [ ] `#simplex <scale=10> <pattern>`
+- [x] `#simplex <scale=10> <pattern>`
 
 ## Current State
 
@@ -16,9 +16,8 @@ does not match FAWE's distribution or visual texture.
 
 ## Implementation Notes
 
-- [ ] Identify FAWE's exact simplex noise behavior and seed handling.
-- [ ] Add a small deterministic noise implementation or dependency.
-- [ ] Make nested weighted/list patterns use the noise value rather than the
+- [x] Identify FAWE's exact simplex noise behavior and seed handling.
+- [x] Add a small deterministic noise implementation or dependency.
+- [x] Make nested weighted/list patterns use the noise value rather than the
       current position hash behavior.
-- [ ] Add tests with fixed coordinates and expected bucket choices.
-
+- [x] Add tests with fixed coordinates and expected bucket choices.

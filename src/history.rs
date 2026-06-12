@@ -22,16 +22,34 @@ use std::collections::HashMap;
 
 use pumpkin_plugin_api::common::BlockPos;
 
+use crate::block_data::BlockPlacement;
+
+/// One undoable edit: for every changed block, its state before and after.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditChange {
+    pub pos: BlockPos,
+    pub before: BlockPlacement,
+    pub after: BlockPlacement,
+}
+
 /// One undoable edit: for every changed block, its state before and after.
 #[derive(Default, Clone)]
 pub struct EditEntry {
-    /// `(position, before_state_id, after_state_id)`.
-    pub changes: Vec<(BlockPos, u16, u16)>,
+    /// Full before/after placements, including sign payloads when present.
+    pub changes: Vec<EditChange>,
 }
 
 impl EditEntry {
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
+    }
+
+    pub fn push_change(&mut self, pos: BlockPos, before: BlockPlacement, after: BlockPlacement) {
+        self.changes.push(EditChange { pos, before, after });
+    }
+
+    pub fn push_state_change(&mut self, pos: BlockPos, before: u16, after: u16) {
+        self.push_change(pos, BlockPlacement::new(before), BlockPlacement::new(after));
     }
 }
 
@@ -114,9 +132,9 @@ mod tests {
     }
 
     fn entry(n: i32) -> EditEntry {
-        EditEntry {
-            changes: vec![(at(n, 0, 0), 0, 1)],
-        }
+        let mut entry = EditEntry::default();
+        entry.push_state_change(at(n, 0, 0), 0, 1);
+        entry
     }
 
     #[test]
@@ -126,21 +144,21 @@ mod tests {
         push(key, entry(2));
 
         let popped = undo(key).unwrap();
-        assert_eq!(popped.changes[0].0.x, 2);
+        assert_eq!(popped.changes[0].pos.x, 2);
 
         let redone = redo(key).unwrap();
-        assert_eq!(redone.changes[0].0.x, 2);
+        assert_eq!(redone.changes[0].pos.x, 2);
 
         // Redo stack is now empty again.
         assert!(redo(key).is_none());
 
         // Redoing entry 2 puts it back on top of the undo stack.
         let popped = undo(key).unwrap();
-        assert_eq!(popped.changes[0].0.x, 2);
+        assert_eq!(popped.changes[0].pos.x, 2);
 
         // Entry 1 is still underneath it.
         let popped = undo(key).unwrap();
-        assert_eq!(popped.changes[0].0.x, 1);
+        assert_eq!(popped.changes[0].pos.x, 1);
     }
 
     #[test]
