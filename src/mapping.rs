@@ -73,8 +73,7 @@ static RUNTIME_BLOCK_TAGS: OnceLock<RwLock<BTreeMap<String, Vec<String>>>> = Onc
 /// the numbering Pumpkin uses. Treat them as best-effort: the generated table
 /// always wins when present.
 ///
-/// NOTE: verify against your Pumpkin build's `blocks.json` before relying on
-/// these for anything beyond a smoke test.
+
 static FALLBACK: &[(&str, u16)] = &[
     ("minecraft:air", 0),
     ("minecraft:stone", 1),
