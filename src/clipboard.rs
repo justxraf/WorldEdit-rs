@@ -221,13 +221,17 @@ pub fn capture_filtered(
         for z in region.min.z..=region.max.z {
             for x in region.min.x..=region.max.x {
                 let pos = BlockPos { x, y, z };
-                let placement = block_data::capture_block(world, pos);
-                let mut state = placement.state_id;
-                if !include(state) {
-                    state = 0;
-                } else if let Some(block_entity) = placement.block_entity {
-                    block_entities.push(((x - origin.x, y - origin.y, z - origin.z), block_entity));
-                }
+                let state = world.get_block_state_id(pos);
+                let state = if include(state) {
+                    let placement = block_data::capture_block_with_state(world, pos, state);
+                    if let Some(block_entity) = placement.block_entity {
+                        block_entities
+                            .push(((x - origin.x, y - origin.y, z - origin.z), block_entity));
+                    }
+                    state
+                } else {
+                    0
+                };
                 blocks.push(((x - origin.x, y - origin.y, z - origin.z), state));
             }
         }

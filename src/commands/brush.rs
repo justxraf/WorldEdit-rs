@@ -2988,12 +2988,13 @@ fn apply_pattern_positions(
     for batch in positions.chunks(batch_size()) {
         let mut changes = Vec::with_capacity(batch.len());
         for &pos in batch {
-            let before = block_data::capture_block(world, pos);
-            if mask.is_some_and(|mask| !mask.matches(before.state_id))
-                || !passes_gmask(key, before.state_id)
+            let before_state = world.get_block_state_id(pos);
+            if mask.is_some_and(|mask| !mask.matches(before_state))
+                || !passes_gmask(key, before_state)
             {
                 continue;
             }
+            let before = block_data::capture_block_with_state(world, pos, before_state);
             let after = pattern.placement_at_with(pos, &before, pattern_ctx);
             if before == after {
                 continue;
@@ -3041,12 +3042,12 @@ fn apply_splatter(
             y: placement.hit.y,
             z: placement.hit.column.z,
         };
-        let before = block_data::capture_block(world, pos);
-        if mask.is_some_and(|mask| !mask.matches(before.state_id))
-            || !passes_gmask(key, before.state_id)
+        let before_state = world.get_block_state_id(pos);
+        if mask.is_some_and(|mask| !mask.matches(before_state)) || !passes_gmask(key, before_state)
         {
             continue;
         }
+        let before = block_data::capture_block_with_state(world, pos, before_state);
         let after = if solid {
             let seed_pos = BlockPos {
                 x: placement.seed.column.x,
@@ -3056,7 +3057,9 @@ fn apply_splatter(
             solid_cache
                 .entry(seed_pos.into())
                 .or_insert_with(|| {
-                    let seed_before = block_data::capture_block(world, seed_pos);
+                    let seed_state = world.get_block_state_id(seed_pos);
+                    let seed_before =
+                        block_data::capture_block_with_state(world, seed_pos, seed_state);
                     pattern.placement_at_with(seed_pos, &seed_before, pattern_ctx)
                 })
                 .clone()
@@ -3119,12 +3122,12 @@ fn apply_scatter(
                 z: hit.column.z,
             }
         };
-        let before = block_data::capture_block(world, pos);
-        if mask.is_some_and(|mask| !mask.matches(before.state_id))
-            || !passes_gmask(key, before.state_id)
+        let before_state = world.get_block_state_id(pos);
+        if mask.is_some_and(|mask| !mask.matches(before_state)) || !passes_gmask(key, before_state)
         {
             continue;
         }
+        let before = block_data::capture_block_with_state(world, pos, before_state);
         let after = pattern.placement_at_with(pos, &before, pattern_ctx);
         if before == after {
             continue;
@@ -3148,16 +3151,17 @@ fn apply_surface(
     let positions = sphere_positions(target, radius, false);
     let mut entry = EditEntry::default();
     for pos in positions {
-        let before = block_data::capture_block(world, pos);
-        if before.state_id == 0
-            || mask.is_some_and(|mask| !mask.matches(before.state_id))
-            || !passes_gmask(key, before.state_id)
+        let before_state = world.get_block_state_id(pos);
+        if before_state == 0
+            || mask.is_some_and(|mask| !mask.matches(before_state))
+            || !passes_gmask(key, before_state)
         {
             continue;
         }
         if !is_air_exposed(world, pos) {
             continue;
         }
+        let before = block_data::capture_block_with_state(world, pos, before_state);
         let after = pattern.placement_at_with(pos, &before, pattern_ctx);
         if before == after {
             continue;
@@ -3198,12 +3202,12 @@ fn apply_overlay(
             y: hit.y + 1,
             z: hit.column.z,
         };
-        let before = block_data::capture_block(world, pos);
-        if mask.is_some_and(|mask| !mask.matches(before.state_id))
-            || !passes_gmask(key, before.state_id)
+        let before_state = world.get_block_state_id(pos);
+        if mask.is_some_and(|mask| !mask.matches(before_state)) || !passes_gmask(key, before_state)
         {
             continue;
         }
+        let before = block_data::capture_block_with_state(world, pos, before_state);
         let after = pattern.placement_at_with(pos, &before, pattern_ctx);
         if before == after {
             continue;
@@ -3323,12 +3327,12 @@ fn apply_shatter(
             y: hit.y,
             z: hit.column.z,
         };
-        let before = block_data::capture_block(world, pos);
-        if mask.is_some_and(|mask| !mask.matches(before.state_id))
-            || !passes_gmask(key, before.state_id)
+        let before_state = world.get_block_state_id(pos);
+        if mask.is_some_and(|mask| !mask.matches(before_state)) || !passes_gmask(key, before_state)
         {
             continue;
         }
+        let before = block_data::capture_block_with_state(world, pos, before_state);
         let after = pattern.placement_at_with(pos, &before, pattern_ctx);
         if before == after {
             continue;

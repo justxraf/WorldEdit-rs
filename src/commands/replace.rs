@@ -94,8 +94,9 @@ impl pumpkin_plugin_api::commands::CommandHandler for ReplaceCommand {
         region.for_each_batch(batch_size(), |batch| {
             let mut changes = Vec::with_capacity(batch.len());
             for &pos in batch {
-                let before = block_data::capture_block(&world, pos);
-                if from_mask.matches(before.state_id) && passes_gmask(&key, before.state_id) {
+                let before_state = world.get_block_state_id(pos);
+                if from_mask.matches(before_state) && passes_gmask(&key, before_state) {
+                    let before = block_data::capture_block_with_state(&world, pos, before_state);
                     let after = to.placement_at_with(pos, &before, &pattern_ctx);
                     if before == after {
                         continue;

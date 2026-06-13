@@ -172,10 +172,11 @@ impl pumpkin_plugin_api::commands::CommandHandler for PasteCommand {
                     y: paste_origin.y + offset.1,
                     z: paste_origin.z + offset.2,
                 };
-                let before = block_data::capture_block(&world, target);
-                if !passes_gmask(&key, before.state_id) {
+                let before_state = world.get_block_state_id(target);
+                if !passes_gmask(&key, before_state) {
                     continue;
                 }
+                let before = block_data::capture_block_with_state(&world, target, before_state);
                 let placement = BlockPlacement {
                     state_id: state,
                     block_entity: buffer.block_entity_at(offset).cloned(),

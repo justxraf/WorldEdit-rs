@@ -189,36 +189,39 @@ impl From<SignColor> for DyeColor {
     }
 }
 
-pub fn capture_block(world: &World, pos: BlockPos) -> BlockPlacement {
-    let state_id = world.get_block_state_id(pos);
-    let block_entity = match world.get_block_entity(pos) {
-        Some(BlockEntityType::SignBlockEntity(sign)) => {
-            Some(BlockEntityData::Sign(SignBlockData {
-                front: face_from_text(sign.get_front_text()),
-                back: face_from_text(sign.get_back_text()),
-                waxed: sign.is_waxed(),
-            }))
-        }
-        Some(BlockEntityType::ChestBlockEntity(chest)) => {
-            let items = (0..chest.size())
-                .map(|slot| {
-                    chest.get_item(slot).map(|item| ItemStackData {
-                        registry_key: item.get_registry_key(),
-                        count: item.get_count(),
-                        components: item
-                            .get_components()
-                            .into_iter()
-                            .map(|component| ItemComponentData {
-                                component: component.component,
-                                value: component.value,
-                            })
-                            .collect(),
+pub fn capture_block_with_state(world: &World, pos: BlockPos, state_id: u16) -> BlockPlacement {
+    let block_entity = if mapping::state_has_block_entity(state_id) {
+        match world.get_block_entity(pos) {
+            Some(BlockEntityType::SignBlockEntity(sign)) => {
+                Some(BlockEntityData::Sign(SignBlockData {
+                    front: face_from_text(sign.get_front_text()),
+                    back: face_from_text(sign.get_back_text()),
+                    waxed: sign.is_waxed(),
+                }))
+            }
+            Some(BlockEntityType::ChestBlockEntity(chest)) => {
+                let items = (0..chest.size())
+                    .map(|slot| {
+                        chest.get_item(slot).map(|item| ItemStackData {
+                            registry_key: item.get_registry_key(),
+                            count: item.get_count(),
+                            components: item
+                                .get_components()
+                                .into_iter()
+                                .map(|component| ItemComponentData {
+                                    component: component.component,
+                                    value: component.value,
+                                })
+                                .collect(),
+                        })
                     })
-                })
-                .collect();
-            Some(BlockEntityData::Chest(ChestBlockData { items }))
+                    .collect();
+                Some(BlockEntityData::Chest(ChestBlockData { items }))
+            }
+            _ => None,
         }
-        _ => None,
+    } else {
+        None
     };
     BlockPlacement {
         state_id,
